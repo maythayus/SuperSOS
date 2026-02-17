@@ -1,82 +1,93 @@
 # SuperSOS
 
-Application Android (Kotlin / Jetpack Compose) d’assistance d’urgence.
+Android emergency assistance app (Kotlin / Jetpack Compose).
 
-## Fonctionnalités
+## Features
 
-- SOS :
-  - Récupération de la position GPS.
-  - Lecture vocale (TTS) de la position.
-  - Appel d’urgence (automatique si permission `CALL_PHONE`, sinon ouverture du composeur).
+- SOS:
+  - Get GPS location.
+  - Text-to-Speech (TTS) voice message with the location.
+  - Emergency call (automatic if `CALL_PHONE` is granted, otherwise open the dialer).
 
-- Bague connectée (App **ECTRI**) :
-  - Scan BLE, connexion, notifications.
-  - Lecture/affichage des constantes :
-    - Fréquence cardiaque (FC)
-    - SpO2 (oxygénation)
-    - Tension (SYS/DIA)
-    - Température
+- Smart ring (App **ECTRI**):
+  - BLE scan, connect, notifications.
+  - Read/display vitals:
+    - Heart rate (HR)
+    - SpO2 (oxygenation)
+    - Blood pressure (SYS/DIA)
+    - Temperature
 
-- Monitoring “engagement vital” (Option A) :
-  - Surveillance périodique des constantes.
-  - Détection par règles + garde-fou (2 mesures consécutives hors seuil).
-  - Alerte avec compte à rebours (10s) + bouton Annuler.
-  - Si non annulé : déclenche le workflow SOS (GPS + voix + appel).
+- Vital monitoring (Option A):
+  - Periodic vitals checks.
+  - Rule-based detection + safeguard (2 consecutive out-of-threshold readings).
+  - Alert with a 10s countdown + Cancel button.
+  - If not cancelled: triggers SOS workflow (GPS + voice + call).
 
-- Bouton “Je ne peux pas parler” :
-  - Lit à voix haute un message clair pour les secours :
-    - consentement aux soins
-    - position GPS + lien Maps
-    - dernières constantes mesurées
+- “I can’t speak” button:
+  - Reads a clear TTS message for first responders:
+    - consent for emergency care
+    - GPS position + Maps link
+    - latest measured vitals
 
-## Permissions Android
+## Android permissions
 
-L’app demande (selon les actions) :
+The app requests (depending on actions):
 
-- Localisation :
+- Location:
   - `ACCESS_FINE_LOCATION`
   - `ACCESS_COARSE_LOCATION`
 
-- Bluetooth (Android 12+) :
+- Bluetooth (Android 12+):
   - `BLUETOOTH_SCAN`
   - `BLUETOOTH_CONNECT`
 
-- Appel (si appel direct) :
+- Calling (for direct calls):
   - `CALL_PHONE`
 
-## BLE ECTRI (détails techniques)
+## ECTRI BLE (technical details)
 
-UUID principaux (extraits de l’app ECTRI) :
+Main UUIDs (extracted from the ECTRI app):
 
 - Service : `F000EFE0-0451-4000-0000-00000000B000`
 - TX (write) : `F000EFE1-0451-4000-0000-00000000B000`
 - RX (notify) : `F000EFE3-0451-4000-0000-00000000B000`
 - CCCD : `00002902-0000-1000-8000-00805f9b34fb`
 
-Types de messages (byte 0 des trames RX 20 bytes) :
+Message types (byte 0 of 20-byte RX frames):
 
-- `0x0A` : FC
-- `0x11` : Tension
-- `0x12` : SpO2
-- `0x40` : Température
+- `0x0A`: HR
+- `0x11`: Blood pressure
+- `0x12`: SpO2
+- `0x40`: Temperature
 
-## Seuils par défaut du monitoring
+## Default monitoring thresholds
 
-- SpO2 : `< 88%`
-- FC : `> 160 bpm` ou `< 40 bpm`
-- Temp : `> 40°C` ou `< 35°C`
-- Tension : `SYS > 180` ou `DIA > 120`
+- SpO2: `< 88%`
+- HR: `> 160 bpm` or `< 40 bpm`
+- Temp: `> 40°C` or `< 35°C`
+- Blood pressure: `SYS > 180` or `DIA > 120`
 
-## Utilisation rapide
+## Quick start
 
-1. Active Bluetooth + localisation.
-2. Ouvre l’app.
-3. Dans “Bague ECTRI” :
-   - “Scanner / trouver la bague”
-   - “Connecter …”
-4. Active “Monitoring vital”.
-5. En cas d’alerte : Annuler si faux positif, sinon laisse l’app déclencher SOS.
+1. Enable Bluetooth + location.
+2. Open the app.
+3. In “ECTRI ring”:
+   - “Scan / find ring”
+   - “Connect …”
+4. Enable “Vital monitoring”.
+5. If an alert triggers: cancel if it is a false positive, otherwise let the app trigger SOS.
 
-## Avertissement
+## Disclaimer
 
-Cette application n’est pas un dispositif médical. Les mesures et alertes sont indicatives et peuvent être imprécises selon le matériel, le port de la bague et les conditions d’usage.
+This app is not a medical device. Measurements and alerts are indicative and may be inaccurate depending on hardware, how the ring is worn, and usage conditions.
+
+
+APP :
+
+https://github.com/maythayus/SuperSOS/releases/tag/SuperSOS.V1
+
+https://xdaforums.com/t/supersos-android-survival-pack.4779243/
+
+Smart RING!
+
+https://maythayus1.store/produit/new-smart-ring-digital-display-5atm-waterproof-heart-ratesleephealth-monitoring-multisports-fashion-ring-for-men-women-2/
