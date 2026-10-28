@@ -14,6 +14,8 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -142,12 +144,14 @@ class MainActivity : ComponentActivity() {
         var alertReason by remember { mutableStateOf<String?>(null) }
         var countdownSeconds by remember { mutableStateOf(10) }
 
-        var spo2LowCount by remember { mutableStateOf(0) }
-        var hrHighCount by remember { mutableStateOf(0) }
-        var hrLowCount by remember { mutableStateOf(0) }
-        var tempHighCount by remember { mutableStateOf(0) }
-        var tempLowCount by remember { mutableStateOf(0) }
-        var bpHighCount by remember { mutableStateOf(0) }
+        val vitalAlerts = remember { VitalAlertEvaluator() }
+
+        val raiseAlert = { reason: String ->
+            alertReason = reason
+            alertActive = true
+            countdownSeconds = 10
+            speak("Alerte vitale détectée. $reason. Appel d'urgence dans dix secondes. Appuyez sur annuler.")
+        }
 
         val mainHandler = remember { Handler(Looper.getMainLooper()) }
         val ectriBleManager = remember {
@@ -185,6 +189,10 @@ class MainActivity : ComponentActivity() {
                                 lastBpLow = measurement.bpLow
                             }
                             measurement.temperatureC?.let { lastTemp = it }
+
+                            if (monitoringEnabled && !alertActive) {
+                                vitalAlerts.onMeasurement(measurement)?.let(raiseAlert)
+                            }
                         }
                     }
                 }
@@ -233,6 +241,35 @@ class MainActivity : ComponentActivity() {
             }
         )
 
+        val consentMessage = { lat: Double?, lon: Double?, number: String ->
+            val hrText = lastHr?.let { "$it battements par minute" } ?: "inconnu"
+            val spo2Text = lastSpo2?.let { "$it pourcent" } ?: "inconnu"
+            val bpText = if (lastBpHigh != null && lastBpLow != null) {
+                "${lastBpHigh} sur ${lastBpLow}"
+            } else {
+                "inconnue"
+            }
+            val tempText = lastTemp?.let { "$it degrés" } ?: "inconnue"
+            val position = if (lat != null && lon != null) {
+                "Ma position est latitude $lat et longitude $lon. " +
+                    "Lien carte https://maps.google.com/?q=$lat,$lon. "
+            } else {
+                "Ma position est inconnue. "
+            }
+
+            "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
+                "Je suis au pays numéro d'urgence $number. " +
+                position +
+                "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
+        }
+
+        val speakConsentAt = { lat: Double, lon: Double ->
+            lastLat = lat
+            lastLon = lon
+            speak(consentMessage(lat, lon, emergencyNumberForCountryIso(getCountryIso())))
+            status = "Message vocal envoyé"
+        }
+
         val locationOnlyPermissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions(),
             onResult = { result ->
@@ -247,30 +284,7 @@ class MainActivity : ComponentActivity() {
 
                 status = "Récupération de la position…"
                 requestOneLocation(
-                    onResult = { lat, lon ->
-                        lastLat = lat
-                        lastLon = lon
-
-                        val number = emergencyNumberForCountryIso(getCountryIso())
-                        val hrText = lastHr?.let { "$it battements par minute" } ?: "inconnu"
-                        val spo2Text = lastSpo2?.let { "$it pourcent" } ?: "inconnu"
-                        val bpText = if (lastBpHigh != null && lastBpLow != null) {
-                            "${lastBpHigh} sur ${lastBpLow}"
-                        } else {
-                            "inconnue"
-                        }
-                        val tempText = lastTemp?.let { "$it degrés" } ?: "inconnue"
-                        val maps = "https://maps.google.com/?q=$lat,$lon"
-
-                        val message = "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
-                            "Je suis au pays numéro d'urgence $number. " +
-                            "Ma position est latitude $lat et longitude $lon. " +
-                            "Lien carte $maps. " +
-                            "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
-
-                        speak(message)
-                        status = "Message vocal envoyé"
-                    },
+                    onResult = { lat, lon -> speakConsentAt(lat, lon) },
                     onError = { err ->
                         status = err
                         speak(err)
@@ -304,30 +318,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 status = "Récupération de la position…"
                 requestOneLocation(
-                    onResult = { lat, lon ->
-                        lastLat = lat
-                        lastLon = lon
-
-                        val number = emergencyNumberForCountryIso(getCountryIso())
-                        val hrText = lastHr?.let { "$it battements par minute" } ?: "inconnu"
-                        val spo2Text = lastSpo2?.let { "$it pourcent" } ?: "inconnu"
-                        val bpText = if (lastBpHigh != null && lastBpLow != null) {
-                            "${lastBpHigh} sur ${lastBpLow}"
-                        } else {
-                            "inconnue"
-                        }
-                        val tempText = lastTemp?.let { "$it degrés" } ?: "inconnue"
-                        val maps = "https://maps.google.com/?q=$lat,$lon"
-
-                        val message = "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
-                            "Je suis au pays numéro d'urgence $number. " +
-                            "Ma position est latitude $lat et longitude $lon. " +
-                            "Lien carte $maps. " +
-                            "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
-
-                        speak(message)
-                        status = "Message vocal envoyé"
-                    },
+                    onResult = { lat, lon -> speakConsentAt(lat, lon) },
                     onError = { err ->
                         status = err
                         speak(err)
@@ -393,77 +384,50 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Evaluate vital rules with 2 consecutive violations guard.
-        LaunchedEffect(monitoringEnabled, lastSpo2, lastHr, lastTemp, lastBpHigh, lastBpLow) {
-            if (!monitoringEnabled) return@LaunchedEffect
-            if (alertActive) return@LaunchedEffect
-
-            val spo2 = lastSpo2
-            val hr = lastHr
-            val temp = lastTemp
-            val bpH = lastBpHigh
-            val bpL = lastBpLow
-
-            val spo2Low = (spo2 != null && spo2 < 88f)
-            val hrHigh = (hr != null && hr > 160)
-            val hrLow = (hr != null && hr < 40)
-            val tempHigh = (temp != null && temp > 40f)
-            val tempLow = (temp != null && temp < 35f)
-            val bpDanger = (bpH != null && bpL != null && (bpH > 180 || bpL > 120))
-
-            spo2LowCount = if (spo2Low) spo2LowCount + 1 else 0
-            hrHighCount = if (hrHigh) hrHighCount + 1 else 0
-            hrLowCount = if (hrLow) hrLowCount + 1 else 0
-            tempHighCount = if (tempHigh) tempHighCount + 1 else 0
-            tempLowCount = if (tempLow) tempLowCount + 1 else 0
-            bpHighCount = if (bpDanger) bpHighCount + 1 else 0
-
-            val reason = when {
-                spo2LowCount >= 2 -> "SpO2 basse (${spo2}%)"
-                hrHighCount >= 2 -> "Fréquence cardiaque élevée (${hr} bpm)"
-                hrLowCount >= 2 -> "Fréquence cardiaque basse (${hr} bpm)"
-                tempHighCount >= 2 -> "Température élevée (${temp}°C)"
-                tempLowCount >= 2 -> "Température basse (${temp}°C)"
-                bpHighCount >= 2 -> "Tension élevée (${bpH}/${bpL})"
-                else -> null
-            }
-
-            if (reason != null) {
-                alertReason = reason
-                alertActive = true
-                countdownSeconds = 10
-                speak("Alerte vitale détectée. $reason. Appel d'urgence dans dix secondes. Appuyez sur annuler.")
-            }
-        }
-
-        // Countdown + auto SOS.
+        // Countdown, then the emergency call itself: nobody may be able to confirm it.
         LaunchedEffect(alertActive, countdownSeconds) {
             if (!alertActive) return@LaunchedEffect
-            if (countdownSeconds <= 0) {
-                alertActive = false
-                val fine = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                val coarse = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-                val call = hasPermission(Manifest.permission.CALL_PHONE)
-                if (!fine && !coarse) {
-                    status = "Permissions SOS manquantes: localisation"
-                    speak("Permissions manquantes pour envoyer votre position")
-                    return@LaunchedEffect
-                }
-                if (!call) {
-                    status = "Permission appel refusée: composeur"
-                }
-
-                requestSosPermissionsAndStart()
+            if (countdownSeconds > 0) {
+                delay(1_000)
+                countdownSeconds -= 1
                 return@LaunchedEffect
             }
 
-            delay(1_000)
-            countdownSeconds -= 1
+            alertActive = false
+            vitalAlerts.reset()
+            val number = emergencyNumberForCountryIso(getCountryIso())
+            val callAndSpeak = { lat: Double?, lon: Double? ->
+                status = if (hasPermission(Manifest.permission.CALL_PHONE)) {
+                    "Appel d'urgence automatique ($number)"
+                } else {
+                    "Permission appel refusée: composeur ouvert ($number)"
+                }
+                startEmergencyCall(number)
+                speak(consentMessage(lat, lon, number))
+            }
+
+            val fine = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+            val coarse = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+            if (!fine && !coarse) {
+                // Without location the call matters more than the position.
+                callAndSpeak(null, null)
+                return@LaunchedEffect
+            }
+            status = "Récupération de la position avant l'appel…"
+            requestOneLocation(
+                onResult = { lat, lon ->
+                    lastLat = lat
+                    lastLon = lon
+                    callAndSpeak(lat, lon)
+                },
+                onError = { callAndSpeak(null, null) }
+            )
         }
 
         Column(
             modifier = modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
@@ -527,6 +491,7 @@ class MainActivity : ComponentActivity() {
                         } else {
                             alertActive = false
                             alertReason = null
+                            vitalAlerts.reset()
                             speak("Monitoring désactivé")
                         }
                     }
@@ -540,12 +505,7 @@ class MainActivity : ComponentActivity() {
                         onClick = {
                             alertActive = false
                             alertReason = null
-                            spo2LowCount = 0
-                            hrHighCount = 0
-                            hrLowCount = 0
-                            tempHighCount = 0
-                            tempLowCount = 0
-                            bpHighCount = 0
+                            vitalAlerts.reset()
                             speak("Alerte annulée")
                         }
                     ) {

@@ -58,6 +58,11 @@ class EctriBleManager(
     private var txChar: BluetoothGattCharacteristic? = null
     private var rxChar: BluetoothGattCharacteristic? = null
 
+    // Android runs one GATT operation at a time: a write issued while another is pending is
+    // dropped. Commands wait here until the previous write (or the CCCD write) has completed.
+    private val pendingWrites = ArrayDeque<ByteArray>()
+    private var gattBusy = false
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
@@ -116,6 +121,15 @@ class EctriBleManager(
 
             listener.onStatus("Activation notifications…")
             enableNotifications(gatt, rxChar!!)
+        }
+
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            onOperationDone()
+        }
+
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) listener.onStatus("Write échoué: $status")
+            onOperationDone()
         }
 
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
@@ -183,8 +197,24 @@ class EctriBleManager(
             return
         }
 
-        val packet = buildWriteHealthTestPacket(testType)
-        write(tx, packet)
+        synchronized(pendingWrites) {
+            pendingWrites.addLast(buildWriteHealthTestPacket(testType))
+        }
+        drainWrites()
+    }
+
+    private fun onOperationDone() {
+        synchronized(pendingWrites) { gattBusy = false }
+        drainWrites()
+    }
+
+    private fun drainWrites() {
+        val tx = txChar ?: return
+        val packet = synchronized(pendingWrites) {
+            if (gattBusy) return
+            pendingWrites.removeFirstOrNull()?.also { gattBusy = true }
+        } ?: return
+        if (!write(tx, packet)) onOperationDone()
     }
 
     private fun buildWriteHealthTestPacket(testType: TestType): ByteArray {
@@ -198,22 +228,22 @@ class EctriBleManager(
     }
 
     @SuppressLint("MissingPermission")
-    private fun write(tx: BluetoothGattCharacteristic, data: ByteArray) {
-        val g = gatt ?: return
+    private fun write(tx: BluetoothGattCharacteristic, data: ByteArray): Boolean {
+        val g = gatt ?: return false
         tx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val result = g.writeCharacteristic(tx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            listener.onStatus("Write: $result")
+        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(tx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
+                BluetoothGatt.GATT_SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
                 tx.value = data
-                @Suppress("DEPRECATION")
-                val ok = g.writeCharacteristic(tx)
-                listener.onStatus("Write: $ok")
+                g.writeCharacteristic(tx)
             }
         }
+        if (!ok) listener.onStatus("Write refusé")
+        return ok
     }
 
     @SuppressLint("MissingPermission")
@@ -230,9 +260,11 @@ class EctriBleManager(
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        synchronized(pendingWrites) { gattBusy = true }
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Android 13+: use non-deprecated overload.
-            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
+                BluetoothGatt.GATT_SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
@@ -240,6 +272,7 @@ class EctriBleManager(
                 gatt.writeDescriptor(desc)
             }
         }
+        if (!started) onOperationDone()
 
         listener.onStatus("Notifications activées")
     }
@@ -301,6 +334,10 @@ class EctriBleManager(
         gatt = null
         txChar = null
         rxChar = null
+        synchronized(pendingWrites) {
+            pendingWrites.clear()
+            gattBusy = false
+        }
     }
 
     companion object {
