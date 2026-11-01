@@ -28,6 +28,12 @@ Android emergency assistance app (Kotlin / Jetpack Compose).
     - consent for emergency care
     - GPS position + Maps link
     - latest measured vitals
+    - height and weight, if filled in
+
+- Height and weight profile:
+  - Entered in the app, stored on the device only (excluded from Android backups).
+  - Added to the voice message so responders can estimate drug doses.
+  - Does not change the monitoring thresholds.
 
 ## Android permissions
 

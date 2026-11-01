@@ -20,7 +20,9 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -33,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.core.content.ContextCompat
@@ -47,6 +50,7 @@ import kotlinx.coroutines.delay
 class MainActivity : ComponentActivity() {
     private val fusedLocationClient by lazy { LocationServices.getFusedLocationProviderClient(this) }
     private var tts: TextToSpeech? = null
+    private val profilePrefs by lazy { getSharedPreferences("health_profile", MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -84,6 +88,18 @@ class MainActivity : ComponentActivity() {
             "au" -> "000"
             else -> "112"
         }
+    }
+
+    private fun loadProfile() = HealthProfile(
+        heightCm = profilePrefs.getInt("height_cm", 0).takeIf { it > 0 },
+        weightKg = profilePrefs.getInt("weight_kg", 0).takeIf { it > 0 }
+    )
+
+    private fun saveProfile(profile: HealthProfile) {
+        profilePrefs.edit()
+            .putInt("height_cm", profile.heightCm ?: 0)
+            .putInt("weight_kg", profile.weightKg ?: 0)
+            .apply()
     }
 
     private fun speak(text: String) {
@@ -138,6 +154,10 @@ class MainActivity : ComponentActivity() {
         var lastBpHigh by remember { mutableStateOf<Int?>(null) }
         var lastBpLow by remember { mutableStateOf<Int?>(null) }
         var lastTemp by remember { mutableStateOf<Float?>(null) }
+
+        var profile by remember { mutableStateOf(loadProfile()) }
+        var heightText by remember { mutableStateOf(profile.heightCm?.toString().orEmpty()) }
+        var weightText by remember { mutableStateOf(profile.weightKg?.toString().orEmpty()) }
 
         var monitoringEnabled by remember { mutableStateOf(false) }
         var alertActive by remember { mutableStateOf(false) }
@@ -260,7 +280,8 @@ class MainActivity : ComponentActivity() {
             "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
                 "Je suis au pays numéro d'urgence $number. " +
                 position +
-                "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
+                "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText." +
+                profile.spokenText()?.let { " $it" }.orEmpty()
         }
 
         val speakConsentAt = { lat: Double, lon: Double ->
@@ -471,6 +492,35 @@ class MainActivity : ComponentActivity() {
             ) {
                 Text("Confirmer l'appel d'urgence")
             }
+
+            Text(text = "---")
+            Text(text = "Profil (lu aux secours)")
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = heightText,
+                onValueChange = {
+                    heightText = it
+                    profile = profile.copy(heightCm = HealthProfile.parseHeightCm(it))
+                    saveProfile(profile)
+                },
+                label = { Text("Taille (cm)") },
+                isError = heightText.isNotBlank() && profile.heightCm == null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = weightText,
+                onValueChange = {
+                    weightText = it
+                    profile = profile.copy(weightKg = HealthProfile.parseWeightKg(it))
+                    saveProfile(profile)
+                },
+                label = { Text("Poids (kg)") },
+                isError = weightText.isNotBlank() && profile.weightKg == null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
 
             Text(text = "---")
             Text(text = "Bague ECTRI")
