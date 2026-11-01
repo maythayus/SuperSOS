@@ -33,6 +33,9 @@ jobs:
           UNSIGNED="$(find app/build/outputs/apk/release -name '*.apk' | head -1)"
           OUT="${{ github.event.repository.name }}-release-signed.apk"
           echo "Build-tools: $BT"; echo "APK: $UNSIGNED"; echo "Sortie: $OUT"
+          trim() { printf '%s' "$1" | tr -d '' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//'; }
+          KEY_ALIAS="$(trim "$KEY_ALIAS")"; KEYSTORE_PASSWORD="$(trim "$KEYSTORE_PASSWORD")"; KEY_PASSWORD="$(trim "$KEY_PASSWORD")"
+          export KEY_ALIAS KEYSTORE_PASSWORD KEY_PASSWORD
           "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
           "$BT/apksigner" sign \
             --ks "$RUNNER_TEMP/release.jks" \
