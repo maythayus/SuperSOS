@@ -22,6 +22,34 @@ class EctriParseTest {
     }
 
     @Test
+    fun temperatureCarriesTheTimeStoredByTheRing() {
+        val payload = IntArray(19)
+        payload[8] = 0x08
+        payload[9] = 0x10
+        payload[11] = 1
+        payload[12] = 110
+        assertEquals("08:10", EctriBleManager.parseMeasurement(0x40, payload, ByteArray(20))?.temperatureTime)
+    }
+
+    @Test
+    fun temperatureCounterFramesAreIgnored() {
+        val payload = IntArray(19)
+        payload[0] = 2
+        payload[11] = 1
+        payload[12] = 110
+        assertNull(EctriBleManager.parseMeasurement(0x40, payload, ByteArray(20)))
+    }
+
+    @Test
+    fun lastTemperatureRequestMatchesEctri() {
+        val packet = EctriBleManager.READ_LAST_TEMPERATURE_PACKET
+        assertEquals(20, packet.size)
+        assertEquals(0xFC.toByte(), packet[0])
+        assertEquals(0x40.toByte(), packet[1])
+        assertEquals(0.toByte(), packet[2])
+    }
+
+    @Test
     fun zeroMeansNoReading() {
         assertNull(parse(0x0A, 0))
         assertNull(parse(0x11, 0, 0, 0))

@@ -22,6 +22,8 @@ Android emergency assistance app (Kotlin / Jetpack Compose).
   - Rule-based detection + safeguard (2 consecutive out-of-threshold readings).
   - Alert with a 10s countdown + Cancel button.
   - If not cancelled: triggers SOS workflow (GPS + voice + call).
+  - Runs in a foreground service, one measurement every 45 seconds, and reconnects to the ring.
+  - Temperature is displayed and read to responders but never raises an alert (stored skin value).
 
 - “I can’t speak” button:
   - Reads a clear TTS message for first responders:
@@ -67,11 +69,13 @@ Message types (byte 0 of 20-byte RX frames):
 - `0x12`: SpO2
 - `0x40`: Temperature
 
+Temperature: `FC 09 07` starts the test, then `FC 40 00` reads the last stored value. Byte 1 of
+`0x40` frames is the frame type (`0` last, `1` history, `2` count, `3` complete, `4` current).
+
 ## Default monitoring thresholds
 
 - SpO2: `< 88%`
 - HR: `> 160 bpm` or `< 40 bpm`
-- Temp: `> 40°C` or `< 35°C`
 - Blood pressure: `SYS > 180` or `DIA > 120`
 
 ## Quick start

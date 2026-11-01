@@ -42,6 +42,8 @@ class EctriBleManager(
         val bpLow: Int? = null,
         val bpHr: Int? = null,
         val temperatureC: Float? = null,
+        /** "HH:mm" stored by the ring with the temperature, which may be an old value. */
+        val temperatureTime: String? = null,
         val rawType: Int,
         val raw: ByteArray,
     )
@@ -281,6 +283,18 @@ class EctriBleManager(
             pendingWrites.addLast(buildWriteHealthTestPacket(testType))
         }
         drainWrites()
+
+        // ECTRI does not receive the temperature from the test: it reads it back from the ring.
+        if (testType == TestType.TEMP) {
+            TEMP_READ_DELAYS_MS.forEach { delay -> handler.postDelayed(::readLastTemperature, delay) }
+        }
+    }
+
+    private fun readLastTemperature() {
+        if (txChar == null) return
+
+        synchronized(pendingWrites) { pendingWrites.addLast(READ_LAST_TEMPERATURE_PACKET) }
+        drainWrites()
     }
 
     private fun onOperationDone() {
@@ -360,6 +374,7 @@ class EctriBleManager(
     // Best-effort cleanup: the try blocks already absorb a SecurityException.
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
+        handler.removeCallbacksAndMessages(null)
         try {
             gatt?.disconnect()
         } catch (_: Throwable) {
@@ -380,6 +395,18 @@ class EctriBleManager(
     companion object {
         private const val MISSING_PERMISSION_STATUS = "Permission bluetooth manquante"
         private const val MAX_DISCOVERY_RETRIES = 3
+        private val TEMP_READ_DELAYS_MS = listOf(15_000L, 30_000L, 45_000L, 60_000L)
+
+        // ECTRI ManBeanEnum.HealthTemp [0xFC, 0x40] with ManHealthType.LastData.
+        val READ_LAST_TEMPERATURE_PACKET = ByteArray(20).also {
+            it[0] = 0xFC.toByte()
+            it[1] = 0x40.toByte()
+        }
+
+        // ECTRI ManHealthType, first payload byte of a HealthTemp frame.
+        private const val FRAME_LAST_DATA = 0
+        private const val FRAME_HISTORY_DATA = 1
+        private const val FRAME_SEND_CURRENT = 4
         private const val DISCOVERY_RETRY_DELAY_MS = 1_500L
 
         // Extracted from ECTRI ManConstants. Rings expose them under the F000xxxx-0451-4000-...
@@ -420,13 +447,20 @@ class EctriBleManager(
                 }
 
                 0x40 -> { // HealthTemp
+                    // Other frame types carry counters, not a temperature.
+                    val frame = payload.getOrNull(0)
+                    if (frame != FRAME_LAST_DATA && frame != FRAME_HISTORY_DATA && frame != FRAME_SEND_CURRENT) {
+                        return null
+                    }
                     val hi = payload.getOrNull(11) ?: return null
                     val lo = payload.getOrNull(12) ?: return null
                     val sign = payload.getOrNull(13)
                     var temp = ((hi shl 8) or lo).toFloat() / 10f
                     if (temp == 0f) return null
                     if (sign != null && sign != 0) temp *= -1f
-                    Measurement(temperatureC = temp, rawType = type, raw = raw)
+                    // Date fields are BCD: 0x08 0x10 reads 08:10.
+                    val time = "%02X:%02X".format(payload[8], payload[9])
+                    Measurement(temperatureC = temp, temperatureTime = time, rawType = type, raw = raw)
                 }
 
                 else -> null
