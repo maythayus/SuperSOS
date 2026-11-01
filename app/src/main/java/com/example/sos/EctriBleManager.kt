@@ -357,51 +357,6 @@ class EctriBleManager(
         listener.onStatus("Notifications activées")
     }
 
-    private fun parseMeasurement(type: Int, payload: IntArray, raw: ByteArray): Measurement? {
-        return when (type) {
-            0x0A -> { // HealthHR
-                val hr = payload.getOrNull(11)
-                Measurement(heartRateBpm = hr, rawType = type, raw = raw)
-            }
-
-            0x11 -> { // HealthBP
-                val hp = payload.getOrNull(11)
-                val lp = payload.getOrNull(12)
-                val hr = payload.getOrNull(13)
-                Measurement(bpHigh = hp, bpLow = lp, bpHr = hr, rawType = type, raw = raw)
-            }
-
-            0x12 -> { // HealthSpO2
-                val intPart = payload.getOrNull(11)
-                val fracRaw = payload.getOrNull(12)
-                val frac = when {
-                    fracRaw == null -> null
-                    fracRaw >= 10 -> (fracRaw.toString().firstOrNull()?.toString()?.toIntOrNull())
-                    else -> fracRaw
-                }
-                val spo2 = if (intPart != null && frac != null) {
-                    ("$intPart.$frac").toFloatOrNull()
-                } else {
-                    null
-                }
-                val pi = payload.getOrNull(13)?.toFloat()?.div(1000f)
-                Measurement(spo2Percent = spo2, rawType = type, raw = raw)
-            }
-
-            0x40 -> { // HealthTemp
-                val hi = payload.getOrNull(11)
-                val lo = payload.getOrNull(12)
-                val sign = payload.getOrNull(13)
-                if (hi == null || lo == null) return null
-                var temp = ((hi shl 8) or lo).toFloat() / 10f
-                if (sign != null && sign != 0) temp *= -1f
-                Measurement(temperatureC = temp, rawType = type, raw = raw)
-            }
-
-            else -> null
-        }
-    }
-
     // Best-effort cleanup: the try blocks already absorb a SecurityException.
     @SuppressLint("MissingPermission")
     private fun closeGatt() {
@@ -433,6 +388,50 @@ class EctriBleManager(
         const val ECTRI_TX_CHAR_ID = 0xEFE1
         const val ECTRI_RX_CHAR_ID = 0xEFE3
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        /**
+         * Decodes a 20-byte ring frame. The ring sends 0 while a measurement is running or when
+         * it is not worn: that is "no reading", never a vital sign, or it would raise an alert.
+         */
+        fun parseMeasurement(type: Int, payload: IntArray, raw: ByteArray): Measurement? {
+            return when (type) {
+                0x0A -> { // HealthHR
+                    val hr = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    Measurement(heartRateBpm = hr, rawType = type, raw = raw)
+                }
+
+                0x11 -> { // HealthBP
+                    val hp = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    val lp = payload.getOrNull(12)?.takeIf { it > 0 } ?: return null
+                    val hr = payload.getOrNull(13)
+                    Measurement(bpHigh = hp, bpLow = lp, bpHr = hr, rawType = type, raw = raw)
+                }
+
+                0x12 -> { // HealthSpO2
+                    val intPart = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    val fracRaw = payload.getOrNull(12) ?: return null
+                    val frac = if (fracRaw >= 10) {
+                        fracRaw.toString().first().digitToInt()
+                    } else {
+                        fracRaw
+                    }
+                    val spo2 = "$intPart.$frac".toFloatOrNull() ?: return null
+                    Measurement(spo2Percent = spo2, rawType = type, raw = raw)
+                }
+
+                0x40 -> { // HealthTemp
+                    val hi = payload.getOrNull(11) ?: return null
+                    val lo = payload.getOrNull(12) ?: return null
+                    val sign = payload.getOrNull(13)
+                    var temp = ((hi shl 8) or lo).toFloat() / 10f
+                    if (temp == 0f) return null
+                    if (sign != null && sign != 0) temp *= -1f
+                    Measurement(temperatureC = temp, rawType = type, raw = raw)
+                }
+
+                else -> null
+            }
+        }
 
         fun hasShortId(uuid: UUID, shortId: Int): Boolean {
             return (uuid.mostSignificantBits ushr 32).toInt() and 0xFFFF == shortId
