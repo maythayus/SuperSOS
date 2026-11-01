@@ -11,7 +11,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.example.sos"
+        applicationId = "com.MaythayusCorp.sos"
         minSdk = 26
         targetSdk = 36
         versionCode = 14
