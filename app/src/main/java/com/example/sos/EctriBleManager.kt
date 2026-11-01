@@ -18,6 +18,8 @@ import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.nio.ByteBuffer
 import java.util.UUID
 
@@ -60,6 +62,8 @@ class EctriBleManager(
     private var gatt: BluetoothGatt? = null
     private var txChar: BluetoothGattCharacteristic? = null
     private var rxChar: BluetoothGattCharacteristic? = null
+    private var discoveryRetries = 0
+    private val handler = Handler(Looper.getMainLooper())
 
     // Android runs one GATT operation at a time: a write issued while another is pending is
     // dropped. Commands wait here until the previous write (or the CCCD write) has completed.
@@ -92,6 +96,7 @@ class EctriBleManager(
                     listener.onStatus("Connecté, découverte services…")
                     this@EctriBleManager.gatt = gatt
                     listener.onConnected(gatt.device)
+                    discoveryRetries = 0
                     if (hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
                         gatt.discoverServices()
                     } else {
@@ -107,20 +112,31 @@ class EctriBleManager(
             }
         }
 
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                listener.onStatus("Découverte services échouée: $status")
+                if (!retryDiscovery(gatt)) {
+                    listener.onStatus("Découverte services échouée: $status")
+                    closeGatt()
+                    listener.onDisconnected()
+                }
                 return
             }
 
-            val service = gatt.getService(ECTRI_SERVICE_UUID)
+            val service = gatt.services.firstOrNull { hasShortId(it.uuid, ECTRI_SERVICE_ID) }
             if (service == null) {
-                listener.onStatus("Service ECTRI introuvable")
+                if (retryDiscovery(gatt)) return
+
+                val found = gatt.services.joinToString { it.uuid.toString().take(8) }
+                listener.onStatus("Service ECTRI introuvable sur ${gatt.device.address}. Services: $found")
+                // Do not keep holding a device that is not usable here (ECTRI may need it).
+                closeGatt()
+                listener.onDisconnected()
                 return
             }
 
-            txChar = service.getCharacteristic(ECTRI_TX_CHAR_UUID)
-            rxChar = service.getCharacteristic(ECTRI_RX_CHAR_UUID)
+            txChar = service.characteristics.firstOrNull { hasShortId(it.uuid, ECTRI_TX_CHAR_ID) }
+            rxChar = service.characteristics.firstOrNull { hasShortId(it.uuid, ECTRI_RX_CHAR_ID) }
 
             if (txChar == null || rxChar == null) {
                 listener.onStatus("TX/RX introuvables")
@@ -144,7 +160,7 @@ class EctriBleManager(
             @Suppress("DEPRECATION")
             val value = characteristic.getValue() ?: return
             if (value.size != 20) return
-            if (characteristic.uuid != ECTRI_RX_CHAR_UUID) return
+            if (!hasShortId(characteristic.uuid, ECTRI_RX_CHAR_ID)) return
 
             val type = value[0].toInt() and 0xFF
             val payload = value.copyOfRange(1, value.size).map { it.toInt() and 0xFF }.toIntArray()
@@ -153,6 +169,27 @@ class EctriBleManager(
                 listener.onMeasurement(m)
             }
         }
+    }
+
+    // Right after connecting, a ring may not answer yet and Android may serve a stale service
+    // cache, so a failed discovery is retried on a refreshed cache before giving up.
+    @SuppressLint("MissingPermission")
+    private fun retryDiscovery(target: BluetoothGatt): Boolean {
+        if (discoveryRetries >= MAX_DISCOVERY_RETRIES) return false
+
+        discoveryRetries += 1
+        listener.onStatus("Recherche des services ($discoveryRetries/$MAX_DISCOVERY_RETRIES)…")
+        try {
+            // Hidden API, best-effort: without it the retry still works on a slow ring.
+            target.javaClass.getMethod("refresh").invoke(target)
+        } catch (_: Exception) {
+        }
+        handler.postDelayed({
+            if (target === gatt && hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                target.discoverServices()
+            }
+        }, DISCOVERY_RETRY_DELAY_MS)
+        return true
     }
 
     // BLUETOOTH_SCAN and BLUETOOTH_CONNECT only exist from Android 12; they can be revoked at any
@@ -182,11 +219,21 @@ class EctriBleManager(
         }
 
         listener.onStatus("Scan…")
+        reportConnectedDevices()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
         scanner.startScan(null, settings, scanCallback)
+    }
+
+    // A ring already held by another app (ECTRI) stops advertising, so the scan cannot see it.
+    @SuppressLint("MissingPermission")
+    private fun reportConnectedDevices() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) return
+
+        val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
+        bm.getConnectedDevices(BluetoothProfile.GATT).forEach { listener.onDeviceFound(it, 0) }
     }
 
     @SuppressLint("MissingPermission")
@@ -209,7 +256,7 @@ class EctriBleManager(
         stopScan()
         listener.onStatus("Connexion…")
         closeGatt()
-        gatt = device.connectGatt(context, false, gattCallback)
+        gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     fun disconnect() {
@@ -221,8 +268,12 @@ class EctriBleManager(
     fun startTest(testType: TestType) {
         val g = gatt
         val tx = txChar
-        if (g == null || tx == null) {
+        if (g == null) {
             listener.onStatus("Pas connecté")
+            return
+        }
+        if (tx == null) {
+            listener.onStatus("Connecté, bague pas encore prête")
             return
         }
 
@@ -373,12 +424,18 @@ class EctriBleManager(
 
     companion object {
         private const val MISSING_PERMISSION_STATUS = "Permission bluetooth manquante"
+        private const val MAX_DISCOVERY_RETRIES = 3
+        private const val DISCOVERY_RETRY_DELAY_MS = 1_500L
 
-        // Extracted from ECTRI ManConstants
-        val ECTRI_SCAN_SERVICE_UUID: UUID = UUID.fromString("0000EFE0-0000-1000-8000-00805F9B34FB")
-        val ECTRI_SERVICE_UUID: UUID = UUID.fromString("F000EFE0-0451-4000-0000-00000000B000")
-        val ECTRI_TX_CHAR_UUID: UUID = UUID.fromString("F000EFE1-0451-4000-0000-00000000B000")
-        val ECTRI_RX_CHAR_UUID: UUID = UUID.fromString("F000EFE3-0451-4000-0000-00000000B000")
+        // Extracted from ECTRI ManConstants. Rings expose them under the F000xxxx-0451-4000-...
+        // base or the standard Bluetooth base, so only the 16-bit id is compared.
+        const val ECTRI_SERVICE_ID = 0xEFE0
+        const val ECTRI_TX_CHAR_ID = 0xEFE1
+        const val ECTRI_RX_CHAR_ID = 0xEFE3
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        fun hasShortId(uuid: UUID, shortId: Int): Boolean {
+            return (uuid.mostSignificantBits ushr 32).toInt() and 0xFFFF == shortId
+        }
     }
 }

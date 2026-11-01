@@ -476,7 +476,7 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(text = "SOS")
+            Text(text = "SOS ${packageManager.getPackageInfo(packageName, 0).versionName}")
             Text(text = status)
 
             if (lastLat != null && lastLon != null) {
@@ -609,7 +609,8 @@ class MainActivity : ComponentActivity() {
                 Text(text = "Aucun appareil trouvé (pour l’instant)")
             } else {
                 Text(text = "Appareils trouvés:")
-                devices.take(5).forEach { (name, addr) ->
+                // Unfiltered scan: nearby devices may be many, the ring must stay reachable.
+                devices.sortedBy { it.first == "(sans nom)" }.forEach { (name, addr) ->
                     Button(
                         modifier = Modifier.fillMaxWidth(),
                         onClick = {

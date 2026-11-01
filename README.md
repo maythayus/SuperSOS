@@ -52,7 +52,8 @@ The app requests (depending on actions):
 
 ## ECTRI BLE (technical details)
 
-Main UUIDs (extracted from the ECTRI app):
+Main UUIDs (extracted from the ECTRI app). Rings may use the standard Bluetooth base instead
+(`0000EFE0-0000-1000-8000-00805F9B34FB`), so the app matches the 16-bit id (`EFE0`, `EFE1`, `EFE3`):
 
 - Service : `F000EFE0-0451-4000-0000-00000000B000`
 - TX (write) : `F000EFE1-0451-4000-0000-00000000B000`
