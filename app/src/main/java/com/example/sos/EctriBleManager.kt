@@ -1,5 +1,6 @@
 package com.example.sos
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -10,11 +11,15 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import java.nio.ByteBuffer
 import java.util.UUID
 
@@ -28,6 +33,8 @@ class EctriBleManager(
         fun onConnected(device: BluetoothDevice)
         fun onDisconnected()
         fun onMeasurement(measurement: Measurement)
+        fun onRawFrame(frame: String)
+        fun onRingGesture(code: Int)
     }
 
     data class Measurement(
@@ -37,6 +44,8 @@ class EctriBleManager(
         val bpLow: Int? = null,
         val bpHr: Int? = null,
         val temperatureC: Float? = null,
+        /** "HH:mm" stored by the ring with the temperature, which may be an old value. */
+        val temperatureTime: String? = null,
         val rawType: Int,
         val raw: ByteArray,
     )
@@ -57,6 +66,15 @@ class EctriBleManager(
     private var gatt: BluetoothGatt? = null
     private var txChar: BluetoothGattCharacteristic? = null
     private var rxChar: BluetoothGattCharacteristic? = null
+    private var discoveryRetries = 0
+    private var temperaturePending = false
+    private var temperatureFrameSeen = false
+    private val handler = Handler(Looper.getMainLooper())
+
+    // Android runs one GATT operation at a time: a write issued while another is pending is
+    // dropped. Commands wait here until the previous write (or the CCCD write) has completed.
+    private val pendingWrites = ArrayDeque<ByteArray>()
+    private var gattBusy = false
 
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
@@ -70,6 +88,7 @@ class EctriBleManager(
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 listener.onStatus("BLE erreur connexion: $status")
@@ -83,7 +102,12 @@ class EctriBleManager(
                     listener.onStatus("Connecté, découverte services…")
                     this@EctriBleManager.gatt = gatt
                     listener.onConnected(gatt.device)
-                    gatt.discoverServices()
+                    discoveryRetries = 0
+                    if (hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                        gatt.discoverServices()
+                    } else {
+                        listener.onStatus(MISSING_PERMISSION_STATUS)
+                    }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -94,20 +118,31 @@ class EctriBleManager(
             }
         }
 
+        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                listener.onStatus("Découverte services échouée: $status")
+                if (!retryDiscovery(gatt)) {
+                    listener.onStatus("Découverte services échouée: $status")
+                    closeGatt()
+                    listener.onDisconnected()
+                }
                 return
             }
 
-            val service = gatt.getService(ECTRI_SERVICE_UUID)
+            val service = gatt.services.firstOrNull { hasShortId(it.uuid, ECTRI_SERVICE_ID) }
             if (service == null) {
-                listener.onStatus("Service ECTRI introuvable")
+                if (retryDiscovery(gatt)) return
+
+                val found = gatt.services.joinToString { it.uuid.toString().take(8) }
+                listener.onStatus("Service ECTRI introuvable sur ${gatt.device.address}. Services: $found")
+                // Do not keep holding a device that is not usable here (ECTRI may need it).
+                closeGatt()
+                listener.onDisconnected()
                 return
             }
 
-            txChar = service.getCharacteristic(ECTRI_TX_CHAR_UUID)
-            rxChar = service.getCharacteristic(ECTRI_RX_CHAR_UUID)
+            txChar = service.characteristics.firstOrNull { hasShortId(it.uuid, ECTRI_TX_CHAR_ID) }
+            rxChar = service.characteristics.firstOrNull { hasShortId(it.uuid, ECTRI_RX_CHAR_ID) }
 
             if (txChar == null || rxChar == null) {
                 listener.onStatus("TX/RX introuvables")
@@ -118,14 +153,29 @@ class EctriBleManager(
             enableNotifications(gatt, rxChar!!)
         }
 
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            onOperationDone()
+        }
+
+        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+            if (status != BluetoothGatt.GATT_SUCCESS) listener.onStatus("Write échoué: $status")
+            onOperationDone()
+        }
+
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             @Suppress("DEPRECATION")
             val value = characteristic.getValue() ?: return
+            // Anything but a measurement is shown, to find out what a tap on the ring sends.
+            val first = value.firstOrNull()?.toInt()?.and(0xFF)
+            val isBattery = first == 0x0F && value.getOrNull(1)?.toInt() == 0x06
+            if (first !in MEASUREMENT_FRAMES && !isBattery) reportRawFrame("Bague", value)
             if (value.size != 20) return
-            if (characteristic.uuid != ECTRI_RX_CHAR_UUID) return
+            ringGesture(value)?.let(listener::onRingGesture)
+            if (!hasShortId(characteristic.uuid, ECTRI_RX_CHAR_ID)) return
 
             val type = value[0].toInt() and 0xFF
             val payload = value.copyOfRange(1, value.size).map { it.toInt() and 0xFF }.toIntArray()
+            if (type == 0x40) onTemperatureFrame(payload, value)
             val m = parseMeasurement(type, payload, value)
             if (m != null) {
                 listener.onMeasurement(m)
@@ -133,7 +183,41 @@ class EctriBleManager(
         }
     }
 
+    // Right after connecting, a ring may not answer yet and Android may serve a stale service
+    // cache, so a failed discovery is retried on a refreshed cache before giving up.
+    @SuppressLint("MissingPermission")
+    private fun retryDiscovery(target: BluetoothGatt): Boolean {
+        if (discoveryRetries >= MAX_DISCOVERY_RETRIES) return false
+
+        discoveryRetries += 1
+        listener.onStatus("Recherche des services ($discoveryRetries/$MAX_DISCOVERY_RETRIES)…")
+        try {
+            // Hidden API, best-effort: without it the retry still works on a slow ring.
+            target.javaClass.getMethod("refresh").invoke(target)
+        } catch (_: Exception) {
+        }
+        handler.postDelayed({
+            if (target === gatt && hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                target.discoverServices()
+            }
+        }, DISCOVERY_RETRY_DELAY_MS)
+        return true
+    }
+
+    // BLUETOOTH_SCAN and BLUETOOTH_CONNECT only exist from Android 12; they can be revoked at any
+    // time and a BLE call made without them throws SecurityException.
+    private fun hasBlePermission(permission: String): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @SuppressLint("MissingPermission")
     fun startScan() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_SCAN)) {
+            listener.onStatus(MISSING_PERMISSION_STATUS)
+            return
+        }
+
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
             listener.onStatus("Bluetooth désactivé")
@@ -147,6 +231,7 @@ class EctriBleManager(
         }
 
         listener.onStatus("Scan…")
+        reportConnectedDevices()
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
@@ -154,7 +239,19 @@ class EctriBleManager(
         scanner.startScan(null, settings, scanCallback)
     }
 
+    // A ring already held by another app (ECTRI) stops advertising, so the scan cannot see it.
+    @SuppressLint("MissingPermission")
+    private fun reportConnectedDevices() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) return
+
+        val bm = context.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager ?: return
+        bm.getConnectedDevices(BluetoothProfile.GATT).forEach { listener.onDeviceFound(it, 0) }
+    }
+
+    @SuppressLint("MissingPermission")
     fun stopScan() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_SCAN)) return
+
         val adapter = bluetoothAdapter ?: return
         val scanner = adapter.bluetoothLeScanner ?: return
         scanner.stopScan(scanCallback)
@@ -163,10 +260,15 @@ class EctriBleManager(
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+            listener.onStatus(MISSING_PERMISSION_STATUS)
+            return
+        }
+
         stopScan()
         listener.onStatus("Connexion…")
         closeGatt()
-        gatt = device.connectGatt(context, false, gattCallback)
+        gatt = device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
     fun disconnect() {
@@ -178,13 +280,81 @@ class EctriBleManager(
     fun startTest(testType: TestType) {
         val g = gatt
         val tx = txChar
-        if (g == null || tx == null) {
+        if (g == null) {
+            listener.onStatus("Pas connecté")
+            return
+        }
+        if (tx == null) {
+            listener.onStatus("Connecté, bague pas encore prête")
+            return
+        }
+
+        synchronized(pendingWrites) {
+            pendingWrites.addLast(buildWriteHealthTestPacket(testType))
+        }
+        drainWrites()
+
+        // ECTRI does not receive the temperature from the test: it reads it back from the ring.
+        if (testType == TestType.TEMP) {
+            temperaturePending = true
+            temperatureFrameSeen = false
+            TEMP_READ_DELAYS_MS.forEach { delay ->
+                handler.postDelayed({ writeRaw(READ_TEMP_COUNT_PACKET) }, delay)
+            }
+            handler.postDelayed(::reportTemperatureSilence, TEMP_READ_DELAYS_MS.last() + TEMP_ANSWER_DELAY_MS)
+        }
+    }
+
+    /** Makes the ring report its gesture to the app, like ECTRI's music control interaction. */
+    fun enableTapControl() {
+        if (txChar == null) {
             listener.onStatus("Pas connecté")
             return
         }
 
-        val packet = buildWriteHealthTestPacket(testType)
-        write(tx, packet)
+        writeRaw(MUSIC_CONTROL_MODE_PACKET)
+        reportRawFrame("Envoyé", MUSIC_CONTROL_MODE_PACKET)
+        listener.onStatus("Double tap: commande envoyée à la bague")
+    }
+
+    private fun writeRaw(packet: ByteArray) {
+        if (txChar == null) return
+
+        synchronized(pendingWrites) { pendingWrites.addLast(packet) }
+        drainWrites()
+    }
+
+    private fun onTemperatureFrame(payload: IntArray, value: ByteArray) {
+        temperatureFrameSeen = true
+        reportRawFrame("Temp", value)
+        if (payload[0] == FRAME_HISTORY_NUM) {
+            val count = (payload[1] shl 8) or payload[2]
+            listener.onStatus("Température: $count mesure(s) dans la bague")
+            if (count > 0) writeRaw(READ_TEMP_HISTORY_PACKET)
+        }
+    }
+
+    private fun reportTemperatureSilence() {
+        temperaturePending = false
+        if (!temperatureFrameSeen) listener.onStatus("Température: aucune réponse de la bague")
+    }
+
+    private fun reportRawFrame(label: String, value: ByteArray) {
+        listener.onRawFrame("$label: " + value.joinToString(" ") { "%02X".format(it) })
+    }
+
+    private fun onOperationDone() {
+        synchronized(pendingWrites) { gattBusy = false }
+        drainWrites()
+    }
+
+    private fun drainWrites() {
+        val tx = txChar ?: return
+        val packet = synchronized(pendingWrites) {
+            if (gattBusy) return
+            pendingWrites.removeFirstOrNull()?.also { gattBusy = true }
+        } ?: return
+        if (!write(tx, packet)) onOperationDone()
     }
 
     private fun buildWriteHealthTestPacket(testType: TestType): ByteArray {
@@ -198,22 +368,22 @@ class EctriBleManager(
     }
 
     @SuppressLint("MissingPermission")
-    private fun write(tx: BluetoothGattCharacteristic, data: ByteArray) {
-        val g = gatt ?: return
+    private fun write(tx: BluetoothGattCharacteristic, data: ByteArray): Boolean {
+        val g = gatt ?: return false
         tx.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            val result = g.writeCharacteristic(tx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            listener.onStatus("Write: $result")
+        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeCharacteristic(tx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
+                BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
                 tx.value = data
-                @Suppress("DEPRECATION")
-                val ok = g.writeCharacteristic(tx)
-                listener.onStatus("Write: $ok")
+                g.writeCharacteristic(tx)
             }
         }
+        if (!ok) listener.onStatus("Write refusé")
+        return ok
     }
 
     @SuppressLint("MissingPermission")
@@ -230,9 +400,11 @@ class EctriBleManager(
             return
         }
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        synchronized(pendingWrites) { gattBusy = true }
+        val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Android 13+: use non-deprecated overload.
-            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
+                BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
@@ -240,56 +412,15 @@ class EctriBleManager(
                 gatt.writeDescriptor(desc)
             }
         }
+        if (!started) onOperationDone()
 
         listener.onStatus("Notifications activées")
     }
 
-    private fun parseMeasurement(type: Int, payload: IntArray, raw: ByteArray): Measurement? {
-        return when (type) {
-            0x0A -> { // HealthHR
-                val hr = payload.getOrNull(11)
-                Measurement(heartRateBpm = hr, rawType = type, raw = raw)
-            }
-
-            0x11 -> { // HealthBP
-                val hp = payload.getOrNull(11)
-                val lp = payload.getOrNull(12)
-                val hr = payload.getOrNull(13)
-                Measurement(bpHigh = hp, bpLow = lp, bpHr = hr, rawType = type, raw = raw)
-            }
-
-            0x12 -> { // HealthSpO2
-                val intPart = payload.getOrNull(11)
-                val fracRaw = payload.getOrNull(12)
-                val frac = when {
-                    fracRaw == null -> null
-                    fracRaw >= 10 -> (fracRaw.toString().firstOrNull()?.toString()?.toIntOrNull())
-                    else -> fracRaw
-                }
-                val spo2 = if (intPart != null && frac != null) {
-                    ("$intPart.$frac").toFloatOrNull()
-                } else {
-                    null
-                }
-                val pi = payload.getOrNull(13)?.toFloat()?.div(1000f)
-                Measurement(spo2Percent = spo2, rawType = type, raw = raw)
-            }
-
-            0x40 -> { // HealthTemp
-                val hi = payload.getOrNull(11)
-                val lo = payload.getOrNull(12)
-                val sign = payload.getOrNull(13)
-                if (hi == null || lo == null) return null
-                var temp = ((hi shl 8) or lo).toFloat() / 10f
-                if (sign != null && sign != 0) temp *= -1f
-                Measurement(temperatureC = temp, rawType = type, raw = raw)
-            }
-
-            else -> null
-        }
-    }
-
+    // Best-effort cleanup: the try blocks already absorb a SecurityException.
+    @SuppressLint("MissingPermission")
     private fun closeGatt() {
+        handler.removeCallbacksAndMessages(null)
         try {
             gatt?.disconnect()
         } catch (_: Throwable) {
@@ -301,14 +432,118 @@ class EctriBleManager(
         gatt = null
         txChar = null
         rxChar = null
+        synchronized(pendingWrites) {
+            pendingWrites.clear()
+            gattBusy = false
+        }
     }
 
     companion object {
-        // Extracted from ECTRI ManConstants
-        val ECTRI_SCAN_SERVICE_UUID: UUID = UUID.fromString("0000EFE0-0000-1000-8000-00805F9B34FB")
-        val ECTRI_SERVICE_UUID: UUID = UUID.fromString("F000EFE0-0451-4000-0000-00000000B000")
-        val ECTRI_TX_CHAR_UUID: UUID = UUID.fromString("F000EFE1-0451-4000-0000-00000000B000")
-        val ECTRI_RX_CHAR_UUID: UUID = UUID.fromString("F000EFE3-0451-4000-0000-00000000B000")
+        private const val MISSING_PERMISSION_STATUS = "Permission bluetooth manquante"
+        private const val MAX_DISCOVERY_RETRIES = 3
+        private val TEMP_READ_DELAYS_MS = listOf(15_000L, 30_000L, 45_000L, 60_000L)
+
+        private const val TEMP_ANSWER_DELAY_MS = 5_000L
+
+        // ECTRI BleCmd.setHidTouch with HidTouchType.MusicControl: type 0x5E, then its 5 bytes.
+        val MUSIC_CONTROL_MODE_PACKET = checkedPacket(0x5E, 0x62, 0x03, 0x09, 0x00, 0x08)
+
+        /** ECTRI BleProtocol: head, type and body on 19 bytes, then the negated sum of them. */
+        private fun checkedPacket(type: Int, vararg body: Int) = ByteArray(20).also { packet ->
+            packet[0] = 0xFC.toByte()
+            packet[1] = type.toByte()
+            body.forEachIndexed { index, value -> packet[index + 2] = value.toByte() }
+            packet[19] = (-packet.sumOf { it.toInt() }).toByte()
+        }
+        private val MEASUREMENT_FRAMES = setOf(0x0A, 0x11, 0x12, 0x40)
+
+        // ECTRI ManBeanEnum.HealthTemp [0xFC, 0x40] with ManHealthType.HistoryNum, then HistoryData.
+        val READ_TEMP_COUNT_PACKET = healthTempPacket(2)
+        val READ_TEMP_HISTORY_PACKET = healthTempPacket(1)
+
+        private fun healthTempPacket(frameType: Int) = ByteArray(20).also {
+            it[0] = 0xFC.toByte()
+            it[1] = 0x40.toByte()
+            it[2] = frameType.toByte()
+        }
+
+        // ECTRI ManHealthType, first payload byte of a HealthTemp frame.
+        private const val FRAME_LAST_DATA = 0
+        private const val FRAME_HISTORY_DATA = 1
+        private const val FRAME_HISTORY_NUM = 2
+        private const val FRAME_SEND_CURRENT = 4
+        private const val DISCOVERY_RETRY_DELAY_MS = 1_500L
+
+        // Extracted from ECTRI ManConstants. Rings expose them under the F000xxxx-0451-4000-...
+        // base or the standard Bluetooth base, so only the 16-bit id is compared.
+        const val ECTRI_SERVICE_ID = 0xEFE0
+        const val ECTRI_TX_CHAR_ID = 0xEFE1
+        const val ECTRI_RX_CHAR_ID = 0xEFE3
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        /**
+         * Decodes a 20-byte ring frame. The ring sends 0 while a measurement is running or when
+         * it is not worn: that is "no reading", never a vital sign, or it would raise an alert.
+         */
+        fun parseMeasurement(type: Int, payload: IntArray, raw: ByteArray): Measurement? {
+            return when (type) {
+                0x0A -> { // HealthHR
+                    val hr = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    Measurement(heartRateBpm = hr, rawType = type, raw = raw)
+                }
+
+                0x11 -> { // HealthBP
+                    val hp = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    val lp = payload.getOrNull(12)?.takeIf { it > 0 } ?: return null
+                    val hr = payload.getOrNull(13)
+                    Measurement(bpHigh = hp, bpLow = lp, bpHr = hr, rawType = type, raw = raw)
+                }
+
+                0x12 -> { // HealthSpO2
+                    val intPart = payload.getOrNull(11)?.takeIf { it > 0 } ?: return null
+                    val fracRaw = payload.getOrNull(12) ?: return null
+                    val frac = if (fracRaw >= 10) {
+                        fracRaw.toString().first().digitToInt()
+                    } else {
+                        fracRaw
+                    }
+                    val spo2 = "$intPart.$frac".toFloatOrNull() ?: return null
+                    Measurement(spo2Percent = spo2, rawType = type, raw = raw)
+                }
+
+                0x40 -> { // HealthTemp
+                    // Other frame types carry counters, not a temperature.
+                    val frame = payload.getOrNull(0)
+                    if (frame != FRAME_LAST_DATA && frame != FRAME_HISTORY_DATA && frame != FRAME_SEND_CURRENT) {
+                        return null
+                    }
+                    val hi = payload.getOrNull(11) ?: return null
+                    val lo = payload.getOrNull(12) ?: return null
+                    val sign = payload.getOrNull(13)
+                    var temp = ((hi shl 8) or lo).toFloat() / 10f
+                    if (temp == 0f) return null
+                    if (sign != null && sign != 0) temp *= -1f
+                    // Date fields are BCD: 0x08 0x10 reads 08:10.
+                    val time = "%02X:%02X".format(payload[8], payload[9])
+                    Measurement(temperatureC = temp, temperatureTime = time, rawType = type, raw = raw)
+                }
+
+                else -> null
+            }
+        }
+
+        // Seen on an R13: 03 for a double tap, 02 less often while mixing double and triple taps.
+        const val GESTURE_RECORD = 3
+        const val GESTURE_SOS = 2
+
+        /** ECTRI ManBeanEnum.ReadMusicControl: FC 3C then the gesture code. */
+        fun ringGesture(frame: ByteArray): Int? {
+            if (frame.size < 3 || frame[0] != 0xFC.toByte() || frame[1] != 0x3C.toByte()) return null
+            return frame[2].toInt() and 0xFF
+        }
+
+        fun hasShortId(uuid: UUID, shortId: Int): Boolean {
+            return (uuid.mostSignificantBits ushr 32).toInt() and 0xFFFF == shortId
+        }
     }
 }

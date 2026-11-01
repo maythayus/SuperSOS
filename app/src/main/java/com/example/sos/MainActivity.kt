@@ -1,55 +1,53 @@
 package com.example.sos
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Intent
-import android.bluetooth.BluetoothManager
 import android.net.Uri
 import android.os.Bundle
-import android.content.pm.PackageManager
-import android.os.Handler
-import android.os.Looper
-import android.speech.tts.TextToSpeech
-import android.telephony.TelephonyManager
+import android.os.PowerManager
+import android.provider.Settings
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.tooling.preview.Preview
-import androidx.core.content.ContextCompat
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import com.example.sos.ui.theme.SOSTheme
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import com.google.android.gms.tasks.CancellationTokenSource
-import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
-    private val fusedLocationClient by lazy { LocationServices.getFusedLocationProviderClient(this) }
-    private var tts: TextToSpeech? = null
+    private val emergency get() = VitalMonitor.emergency
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        tts = TextToSpeech(this) { }
+        VitalMonitor.init(this)
+        if (VitalMonitor.monitoringEnabled) VitalMonitor.ensureServiceRunning()
 
         enableEdgeToEdge()
         setContent {
@@ -61,62 +59,46 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        tts?.stop()
-        tts?.shutdown()
-        tts = null
-    }
-
-    private fun hasPermission(permission: String): Boolean {
-        return ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
-    }
-
-    private fun emergencyNumberForCountryIso(countryIso: String?): String {
-        val iso = countryIso?.trim()?.lowercase().orEmpty()
-        return when (iso) {
-            "us", "ca" -> "911"
-            "mx" -> "911"
-            "br" -> "190"
-            "gb" -> "999"
-            "au" -> "000"
-            else -> "112"
+    // A ring tap may reach Android as a keyboard or touch device instead of a BLE frame.
+    @SuppressLint("RestrictedApi")
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            VitalMonitor.logRaw("Touche: ${KeyEvent.keyCodeToString(event.keyCode)} (${event.device?.name})")
         }
+        return super.dispatchKeyEvent(event)
     }
 
-    private fun speak(text: String) {
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "sos")
-    }
-
-    private fun startEmergencyCall(number: String) {
-        val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
-        if (hasPermission(Manifest.permission.CALL_PHONE)) {
-            startActivity(callIntent)
-        } else {
-            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number"))
-            startActivity(dialIntent)
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val external = android.os.Build.VERSION.SDK_INT >= 29 && event.device?.isExternal == true
+        if (external && event.actionMasked == MotionEvent.ACTION_DOWN) {
+            VitalMonitor.logRaw("Geste: ${event.device?.name}")
         }
+        return super.dispatchTouchEvent(event)
     }
 
-    private fun getCountryIso(): String? {
-        val tm = getSystemService(TELEPHONY_SERVICE) as? TelephonyManager
-        return tm?.networkCountryIso?.takeIf { it.isNotBlank() }
-    }
+    private fun hasPermission(permission: String) = emergency.hasPermission(permission)
+
+    private fun speak(text: String) = emergency.speak(text)
+
+    private fun emergencyNumberForCountryIso(countryIso: String?) = emergency.emergencyNumberForCountryIso(countryIso)
+
+    private fun getCountryIso() = emergency.getCountryIso()
+
+    private fun startEmergencyCall(number: String) = emergency.startEmergencyCall(number)
 
     private fun requestOneLocation(onResult: (Double, Double) -> Unit, onError: (String) -> Unit) {
-        val tokenSource = CancellationTokenSource()
-        fusedLocationClient
-            .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
-            .addOnSuccessListener { loc ->
-                if (loc == null) {
-                    onError("Position indisponible")
-                } else {
-                    onResult(loc.latitude, loc.longitude)
-                }
-            }
-            .addOnFailureListener { e ->
-                onError(e.message ?: "Erreur localisation")
-            }
+        emergency.requestOneLocation(onResult, onError)
+    }
+
+    // Without this, Doze suspends the monitoring on many phones despite the foreground service.
+    @SuppressLint("BatteryLife")
+    private fun requestBatteryExemption() {
+        val power = getSystemService(POWER_SERVICE) as PowerManager
+        if (power.isIgnoringBatteryOptimizations(packageName)) return
+
+        startActivity(
+            Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+        )
     }
 
     @Composable
@@ -128,68 +110,27 @@ class MainActivity : ComponentActivity() {
         var canCallDirectly by remember { mutableStateOf(false) }
         var readyToCall by remember { mutableStateOf(false) }
 
-        var bleStatus by remember { mutableStateOf("BLE: prêt") }
-        var connectedDeviceName by remember { mutableStateOf<String?>(null) }
-        val devices = remember { mutableStateListOf<Pair<String, String>>() }
-        var lastHr by remember { mutableStateOf<Int?>(null) }
-        var lastSpo2 by remember { mutableStateOf<Float?>(null) }
-        var lastBpHigh by remember { mutableStateOf<Int?>(null) }
-        var lastBpLow by remember { mutableStateOf<Int?>(null) }
-        var lastTemp by remember { mutableStateOf<Float?>(null) }
+        var heightText by remember { mutableStateOf(VitalMonitor.profile.heightCm?.toString().orEmpty()) }
+        var weightText by remember { mutableStateOf(VitalMonitor.profile.weightKg?.toString().orEmpty()) }
 
-        var monitoringEnabled by remember { mutableStateOf(false) }
-        var alertActive by remember { mutableStateOf(false) }
-        var alertReason by remember { mutableStateOf<String?>(null) }
-        var countdownSeconds by remember { mutableStateOf(10) }
-
-        var spo2LowCount by remember { mutableStateOf(0) }
-        var hrHighCount by remember { mutableStateOf(0) }
-        var hrLowCount by remember { mutableStateOf(0) }
-        var tempHighCount by remember { mutableStateOf(0) }
-        var tempLowCount by remember { mutableStateOf(0) }
-        var bpHighCount by remember { mutableStateOf(0) }
-
-        val mainHandler = remember { Handler(Looper.getMainLooper()) }
-        val ectriBleManager = remember {
-            EctriBleManager(
-                context = this,
-                listener = object : EctriBleManager.Listener {
-                    override fun onStatus(status: String) {
-                        mainHandler.post { bleStatus = "BLE: $status" }
-                    }
-
-                    override fun onDeviceFound(device: android.bluetooth.BluetoothDevice, rssi: Int) {
-                        val addr = device.address ?: return
-                        val name = device.name ?: "(sans nom)"
-                        mainHandler.post {
-                            val exists = devices.any { it.second == addr }
-                            if (!exists) devices.add(name to addr)
-                        }
-                    }
-
-                    override fun onConnected(device: android.bluetooth.BluetoothDevice) {
-                        val name = device.name ?: device.address
-                        mainHandler.post { connectedDeviceName = name }
-                    }
-
-                    override fun onDisconnected() {
-                        mainHandler.post { connectedDeviceName = null }
-                    }
-
-                    override fun onMeasurement(measurement: EctriBleManager.Measurement) {
-                        mainHandler.post {
-                            measurement.heartRateBpm?.let { lastHr = it }
-                            measurement.spo2Percent?.let { lastSpo2 = it }
-                            if (measurement.bpHigh != null && measurement.bpLow != null) {
-                                lastBpHigh = measurement.bpHigh
-                                lastBpLow = measurement.bpLow
-                            }
-                            measurement.temperatureC?.let { lastTemp = it }
-                        }
-                    }
-                }
-            )
+        val startMonitoring = {
+            VitalMonitor.setMonitoring(true)
+            requestBatteryExemption()
         }
+        val microphonePermissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission(),
+            onResult = { granted ->
+                if (granted) {
+                    // A running service must be told it may now use the microphone.
+                    if (VitalMonitor.serviceRunning) VitalMonitor.ensureServiceRunning()
+                    VitalMonitor.toggleRecording("bouton")
+                }
+            }
+        )
+        val notificationPermissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission(),
+            onResult = { startMonitoring() }
+        )
 
         val permissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions(),
@@ -233,6 +174,13 @@ class MainActivity : ComponentActivity() {
             }
         )
 
+        val speakConsentAt = { lat: Double, lon: Double ->
+            lastLat = lat
+            lastLon = lon
+            speak(VitalMonitor.consentMessage(lat, lon, emergencyNumberForCountryIso(getCountryIso())))
+            status = "Message vocal envoyé"
+        }
+
         val locationOnlyPermissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestMultiplePermissions(),
             onResult = { result ->
@@ -247,30 +195,7 @@ class MainActivity : ComponentActivity() {
 
                 status = "Récupération de la position…"
                 requestOneLocation(
-                    onResult = { lat, lon ->
-                        lastLat = lat
-                        lastLon = lon
-
-                        val number = emergencyNumberForCountryIso(getCountryIso())
-                        val hrText = lastHr?.let { "$it battements par minute" } ?: "inconnu"
-                        val spo2Text = lastSpo2?.let { "$it pourcent" } ?: "inconnu"
-                        val bpText = if (lastBpHigh != null && lastBpLow != null) {
-                            "${lastBpHigh} sur ${lastBpLow}"
-                        } else {
-                            "inconnue"
-                        }
-                        val tempText = lastTemp?.let { "$it degrés" } ?: "inconnue"
-                        val maps = "https://maps.google.com/?q=$lat,$lon"
-
-                        val message = "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
-                            "Je suis au pays numéro d'urgence $number. " +
-                            "Ma position est latitude $lat et longitude $lon. " +
-                            "Lien carte $maps. " +
-                            "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
-
-                        speak(message)
-                        status = "Message vocal envoyé"
-                    },
+                    onResult = { lat, lon -> speakConsentAt(lat, lon) },
                     onError = { err ->
                         status = err
                         speak(err)
@@ -304,30 +229,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 status = "Récupération de la position…"
                 requestOneLocation(
-                    onResult = { lat, lon ->
-                        lastLat = lat
-                        lastLon = lon
-
-                        val number = emergencyNumberForCountryIso(getCountryIso())
-                        val hrText = lastHr?.let { "$it battements par minute" } ?: "inconnu"
-                        val spo2Text = lastSpo2?.let { "$it pourcent" } ?: "inconnu"
-                        val bpText = if (lastBpHigh != null && lastBpLow != null) {
-                            "${lastBpHigh} sur ${lastBpLow}"
-                        } else {
-                            "inconnue"
-                        }
-                        val tempText = lastTemp?.let { "$it degrés" } ?: "inconnue"
-                        val maps = "https://maps.google.com/?q=$lat,$lon"
-
-                        val message = "Je ne peux pas parler. J'ai besoin d'aide. Je consens à recevoir des soins d'urgence. " +
-                            "Je suis au pays numéro d'urgence $number. " +
-                            "Ma position est latitude $lat et longitude $lon. " +
-                            "Lien carte $maps. " +
-                            "Mes constantes: fréquence cardiaque $hrText. Oxygénation $spo2Text. Tension $bpText. Température $tempText."
-
-                        speak(message)
-                        status = "Message vocal envoyé"
-                    },
+                    onResult = { lat, lon -> speakConsentAt(lat, lon) },
                     onError = { err ->
                         status = err
                         speak(err)
@@ -355,18 +257,17 @@ class MainActivity : ComponentActivity() {
                     (hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) || hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION))
 
                 if (!scanGranted || !connectGranted) {
-                    bleStatus = "BLE: permission bluetooth refusée"
+                    VitalMonitor.reportBleStatus("permission bluetooth refusée")
                     return@rememberLauncherForActivityResult
                 }
 
                 if (!locGranted) {
                     // Sur certains appareils < Android 12, le scan exige la localisation.
-                    bleStatus = "BLE: permission localisation requise pour scanner"
+                    VitalMonitor.reportBleStatus("permission localisation requise pour scanner")
                     return@rememberLauncherForActivityResult
                 }
 
-                devices.clear()
-                ectriBleManager.startScan()
+                VitalMonitor.startScan()
             }
         )
 
@@ -378,98 +279,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Periodic measurement requests (best-effort).
-        LaunchedEffect(monitoringEnabled, connectedDeviceName) {
-            if (!monitoringEnabled) return@LaunchedEffect
-            if (connectedDeviceName == null) return@LaunchedEffect
-
-            while (monitoringEnabled && connectedDeviceName != null) {
-                ectriBleManager.startTest(EctriBleManager.TestType.HR)
-                ectriBleManager.startTest(EctriBleManager.TestType.SPO2)
-                ectriBleManager.startTest(EctriBleManager.TestType.TEMP)
-                // BP is slower / more intrusive; run less frequently.
-                ectriBleManager.startTest(EctriBleManager.TestType.BP)
-                delay(30_000)
-            }
-        }
-
-        // Evaluate vital rules with 2 consecutive violations guard.
-        LaunchedEffect(monitoringEnabled, lastSpo2, lastHr, lastTemp, lastBpHigh, lastBpLow) {
-            if (!monitoringEnabled) return@LaunchedEffect
-            if (alertActive) return@LaunchedEffect
-
-            val spo2 = lastSpo2
-            val hr = lastHr
-            val temp = lastTemp
-            val bpH = lastBpHigh
-            val bpL = lastBpLow
-
-            val spo2Low = (spo2 != null && spo2 < 88f)
-            val hrHigh = (hr != null && hr > 160)
-            val hrLow = (hr != null && hr < 40)
-            val tempHigh = (temp != null && temp > 40f)
-            val tempLow = (temp != null && temp < 35f)
-            val bpDanger = (bpH != null && bpL != null && (bpH > 180 || bpL > 120))
-
-            spo2LowCount = if (spo2Low) spo2LowCount + 1 else 0
-            hrHighCount = if (hrHigh) hrHighCount + 1 else 0
-            hrLowCount = if (hrLow) hrLowCount + 1 else 0
-            tempHighCount = if (tempHigh) tempHighCount + 1 else 0
-            tempLowCount = if (tempLow) tempLowCount + 1 else 0
-            bpHighCount = if (bpDanger) bpHighCount + 1 else 0
-
-            val reason = when {
-                spo2LowCount >= 2 -> "SpO2 basse (${spo2}%)"
-                hrHighCount >= 2 -> "Fréquence cardiaque élevée (${hr} bpm)"
-                hrLowCount >= 2 -> "Fréquence cardiaque basse (${hr} bpm)"
-                tempHighCount >= 2 -> "Température élevée (${temp}°C)"
-                tempLowCount >= 2 -> "Température basse (${temp}°C)"
-                bpHighCount >= 2 -> "Tension élevée (${bpH}/${bpL})"
-                else -> null
-            }
-
-            if (reason != null) {
-                alertReason = reason
-                alertActive = true
-                countdownSeconds = 10
-                speak("Alerte vitale détectée. $reason. Appel d'urgence dans dix secondes. Appuyez sur annuler.")
-            }
-        }
-
-        // Countdown + auto SOS.
-        LaunchedEffect(alertActive, countdownSeconds) {
-            if (!alertActive) return@LaunchedEffect
-            if (countdownSeconds <= 0) {
-                alertActive = false
-                val fine = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-                val coarse = hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-                val call = hasPermission(Manifest.permission.CALL_PHONE)
-                if (!fine && !coarse) {
-                    status = "Permissions SOS manquantes: localisation"
-                    speak("Permissions manquantes pour envoyer votre position")
-                    return@LaunchedEffect
-                }
-                if (!call) {
-                    status = "Permission appel refusée: composeur"
-                }
-
-                requestSosPermissionsAndStart()
-                return@LaunchedEffect
-            }
-
-            delay(1_000)
-            countdownSeconds -= 1
-        }
-
         Column(
             modifier = modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text(text = "SOS")
+            Text(text = "SOS ${packageManager.getPackageInfo(packageName, 0).versionName}")
             Text(text = status)
+            VitalMonitor.sosStatus?.let { Text(text = it) }
 
             if (lastLat != null && lastLon != null) {
                 Text(text = "Latitude: ${lastLat}")
@@ -509,45 +329,76 @@ class MainActivity : ComponentActivity() {
             }
 
             Text(text = "---")
+            Text(text = "Profil (lu aux secours)")
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = heightText,
+                onValueChange = {
+                    heightText = it
+                    VitalMonitor.updateProfile(VitalMonitor.profile.copy(heightCm = HealthProfile.parseHeightCm(it)))
+                },
+                label = { Text("Taille (cm)") },
+                isError = heightText.isNotBlank() && VitalMonitor.profile.heightCm == null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+            OutlinedTextField(
+                modifier = Modifier.fillMaxWidth(),
+                value = weightText,
+                onValueChange = {
+                    weightText = it
+                    VitalMonitor.updateProfile(VitalMonitor.profile.copy(weightKg = HealthProfile.parseWeightKg(it)))
+                },
+                label = { Text("Poids (kg)") },
+                isError = weightText.isNotBlank() && VitalMonitor.profile.weightKg == null,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                singleLine = true
+            )
+
+            Text(text = "---")
+            Text(text = VitalMonitor.recordingFile?.let { "Enregistrement en cours: $it" } ?: "Enregistrement arrêté")
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    if (hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                        VitalMonitor.toggleRecording("bouton")
+                    } else {
+                        microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+            ) {
+                Text(if (VitalMonitor.recordingFile != null) "Arrêter l'enregistrement" else "Enregistrer (micro)")
+            }
+
+            Text(text = "---")
             Text(text = "Bague ECTRI")
-            Text(text = bleStatus)
-            Text(text = "Connecté: ${connectedDeviceName ?: "non"}")
+            Text(text = VitalMonitor.bleStatus)
+            Text(text = "Connecté: ${VitalMonitor.connectedDeviceName ?: "non"}")
 
             Column(
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Text(text = "Monitoring vital: ${if (monitoringEnabled) "ON" else "OFF"}")
+                Text(text = "Monitoring vital: ${if (VitalMonitor.monitoringEnabled) "ON" else "OFF"}")
                 Switch(
-                    checked = monitoringEnabled,
+                    checked = VitalMonitor.monitoringEnabled,
                     onCheckedChange = { enabled ->
-                        monitoringEnabled = enabled
-                        if (enabled) {
-                            speak("Monitoring activé")
-                        } else {
-                            alertActive = false
-                            alertReason = null
-                            speak("Monitoring désactivé")
+                        when {
+                            !enabled -> VitalMonitor.setMonitoring(false)
+                            android.os.Build.VERSION.SDK_INT >= 33 &&
+                                !hasPermission(Manifest.permission.POST_NOTIFICATIONS) ->
+                                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                            else -> startMonitoring()
                         }
                     }
                 )
 
-                if (alertActive) {
-                    Text(text = "ALERTE: ${alertReason ?: ""}")
-                    Text(text = "Appel SOS dans: ${countdownSeconds}s")
+                if (VitalMonitor.alertActive) {
+                    Text(text = "ALERTE: ${VitalMonitor.alertReason ?: ""}")
+                    Text(text = "Appel SOS dans: ${VitalMonitor.countdownSeconds}s")
                     Button(
                         modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            alertActive = false
-                            alertReason = null
-                            spo2LowCount = 0
-                            hrHighCount = 0
-                            hrLowCount = 0
-                            tempHighCount = 0
-                            tempLowCount = 0
-                            bpHighCount = 0
-                            speak("Alerte annulée")
-                        }
+                        onClick = { VitalMonitor.cancelAlert() }
                     ) {
                         Text("Annuler")
                     }
@@ -572,19 +423,15 @@ class MainActivity : ComponentActivity() {
                 Text("Scanner / trouver la bague")
             }
 
-            if (devices.isEmpty()) {
+            if (VitalMonitor.devices.isEmpty()) {
                 Text(text = "Aucun appareil trouvé (pour l’instant)")
             } else {
                 Text(text = "Appareils trouvés:")
-                devices.take(5).forEach { (name, addr) ->
+                // Unfiltered scan: nearby devices may be many, the ring must stay reachable.
+                VitalMonitor.devices.sortedBy { it.first == "(sans nom)" }.forEach { (name, addr) ->
                     Button(
                         modifier = Modifier.fillMaxWidth(),
-                        onClick = {
-                            val manager = getSystemService(BLUETOOTH_SERVICE) as? BluetoothManager
-                            val adapter = manager?.adapter
-                            val dev = adapter?.getRemoteDevice(addr)
-                            if (dev != null) ectriBleManager.connect(dev)
-                        }
+                        onClick = { VitalMonitor.connect(addr) }
                     ) {
                         Text("Connecter: $name ($addr)")
                     }
@@ -593,36 +440,45 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                onClick = { ectriBleManager.startTest(EctriBleManager.TestType.HR) }
+                onClick = { VitalMonitor.enableTapControl() }
+            ) {
+                Text("Activer le double tap (enregistrement)")
+            }
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = { VitalMonitor.startTest(EctriBleManager.TestType.HR) }
             ) {
                 Text("Mesurer FC")
             }
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                onClick = { ectriBleManager.startTest(EctriBleManager.TestType.SPO2) }
+                onClick = { VitalMonitor.startTest(EctriBleManager.TestType.SPO2) }
             ) {
                 Text("Mesurer SpO2")
             }
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                onClick = { ectriBleManager.startTest(EctriBleManager.TestType.BP) }
+                onClick = { VitalMonitor.startTest(EctriBleManager.TestType.BP) }
             ) {
                 Text("Mesurer tension")
             }
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
-                onClick = { ectriBleManager.startTest(EctriBleManager.TestType.TEMP) }
+                onClick = { VitalMonitor.startTest(EctriBleManager.TestType.TEMP) }
             ) {
                 Text("Mesurer température")
             }
 
-            Text(text = "FC: ${lastHr ?: "--"} bpm")
-            Text(text = "SpO2: ${lastSpo2 ?: "--"} %")
-            Text(text = "Tension: ${lastBpHigh ?: "--"}/${lastBpLow ?: "--"}")
-            Text(text = "Temp: ${lastTemp ?: "--"} °C")
+            Text(text = "FC: ${VitalMonitor.lastHr ?: "--"} bpm")
+            Text(text = "SpO2: ${VitalMonitor.lastSpo2 ?: "--"} %")
+            Text(text = "Tension: ${VitalMonitor.lastBpHigh ?: "--"}/${VitalMonitor.lastBpLow ?: "--"}")
+            Text(text = "Temp: ${VitalMonitor.lastTemp ?: "--"} °C${VitalMonitor.lastTempTime?.let { " (mesurée à $it)" }.orEmpty()}")
+            Text(text = "Journal bague:")
+            VitalMonitor.rawLog.forEach { Text(text = it) }
         }
     }
 }
