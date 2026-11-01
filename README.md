@@ -7,9 +7,9 @@ Android emergency assistance app (Kotlin / Jetpack Compose).
 - SOS:
   - Get GPS location.
   - Text-to-Speech (TTS) voice message with the location.
-  - Emergency call (automatic if `CALL_PHONE` is granted, otherwise open the dialer).
+  - Emergency call if `CALL_PHONE` is granted, otherwise opens the dialer. Android may only open the dialer for an emergency number, so a person may still have to press Call.
 
-- Smart ring (App **ECTRI**):
+- Smart ring (App **ECTRI**, tested with an R13 ring):
   - BLE scan, connect, notifications.
   - Read/display vitals:
     - Heart rate (HR)
@@ -93,12 +93,12 @@ Temperature: `FC 09 07` starts the test, then `FC 40 00` reads the last stored v
 This app is not a medical device. Measurements and alerts are indicative and may be inaccurate depending on hardware, how the ring is worn, and usage conditions.
 
 
-APP :
+Monitoring is not guaranteed: Bluetooth being off, an empty battery or a phone maker's battery management can interrupt it. A confirmed alert takes about 6 minutes to raise. Do not rely on this app as your only safety measure.
 
-https://github.com/maythayus/SuperSOS/releases/tag/SuperSOS.V1
+## Download
 
-https://xdaforums.com/t/supersos-android-survival-pack.4779243/
+- [Latest release (APK)](https://github.com/maythayus/SuperSOS/releases/latest)
+- [XDA thread](https://xdaforums.com/t/supersos-android-survival-pack.4779243/)
+- [Smart ring](https://maythayus1.store/produit/new-smart-ring-digital-display-5atm-waterproof-heart-ratesleephealth-monitoring-multisports-fashion-ring-for-men-women-2/)
 
-Smart RING!
-
-https://maythayus1.store/produit/new-smart-ring-digital-display-5atm-waterproof-heart-ratesleephealth-monitoring-multisports-fashion-ring-for-men-women-2/
+Force stop the ECTRI app before connecting the ring in SuperSOS. If you installed V1, uninstall it first: later versions use a different signing key.
