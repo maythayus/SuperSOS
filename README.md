@@ -37,6 +37,11 @@ Android emergency assistance app (Kotlin / Jetpack Compose).
   - Added to the voice message so responders can estimate drug doses.
   - Does not change the monitoring thresholds.
 
+- Voice recording:
+  - Records the phone microphone to `Music/SuperSOS`, from a button or a double tap on the ring.
+  - `FC 3C 03` (double tap) starts or stops the recording, `FC 3C 02` raises the SOS countdown.
+  - The ring reports the tap once its interaction mode is set to music control (`FC 5E 62 03 09 00 08`, then `FC 3C` frames, `FC 3C 03` on an R13).
+
 ## Android permissions
 
 The app requests (depending on actions):
@@ -51,6 +56,9 @@ The app requests (depending on actions):
 
 - Calling (for direct calls):
   - `CALL_PHONE`
+
+- Recording:
+  - `RECORD_AUDIO`
 
 ## ECTRI BLE (technical details)
 
@@ -69,7 +77,7 @@ Message types (byte 0 of 20-byte RX frames):
 - `0x12`: SpO2
 - `0x40`: Temperature
 
-Temperature: `FC 09 07` starts the test, then `FC 40 00` reads the last stored value. Byte 1 of
+Temperature: `FC 09 07` starts the test, `FC 40 02` asks how many values are stored and `FC 40 01` reads them. Byte 1 of
 `0x40` frames is the frame type (`0` last, `1` history, `2` count, `3` complete, `4` current).
 
 ## Default monitoring thresholds
@@ -92,6 +100,8 @@ Temperature: `FC 09 07` starts the test, then `FC 40 00` reads the last stored v
 
 This app is not a medical device. Measurements and alerts are indicative and may be inaccurate depending on hardware, how the ring is worn, and usage conditions.
 
+
+Temperature is not received from the R13 ring yet. Height and weight do not change the alert thresholds.
 
 Monitoring is not guaranteed: Bluetooth being off, an empty battery or a phone maker's battery management can interrupt it. A confirmed alert takes about 6 minutes to raise. Do not rely on this app as your only safety measure.
 

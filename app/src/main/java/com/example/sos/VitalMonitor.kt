@@ -12,12 +12,18 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /**
  * Ring connection, vital checks and alert countdown. It lives with the process rather than with
@@ -33,6 +39,8 @@ object VitalMonitor {
     private const val KEY_ADDRESS = "ring_address"
     private const val MEASURE_INTERVAL_MS = 45_000L
     private const val RECONNECT_INTERVAL_MS = 40_000L
+    private const val RAW_LOG_SIZE = 20
+    private const val TAP_DEBOUNCE_MS = 1_000L
 
     // The ring runs one test at a time: starting them together would cancel all but the last.
     private val MEASURE_ORDER = listOf(
@@ -61,6 +69,9 @@ object VitalMonitor {
         private set
     var lastTempTime by mutableStateOf<String?>(null)
         private set
+    val rawLog = mutableStateListOf<String>()
+    var recordingFile by mutableStateOf<String?>(null)
+        private set
     var monitoringEnabled by mutableStateOf(false)
         private set
     var alertActive by mutableStateOf(false)
@@ -76,9 +87,12 @@ object VitalMonitor {
         private set
     private lateinit var appContext: Context
     private lateinit var ble: EctriBleManager
+    private lateinit var audioRecorder: AudioRecorder
     private val handler = Handler(Looper.getMainLooper())
     private val vitalAlerts = VitalAlertEvaluator()
     private var measureIndex = 0
+    private var lastTapMs = 0L
+    var serviceRunning = false
 
     private val prefs by lazy { appContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
     private val profilePrefs by lazy { appContext.getSharedPreferences("health_profile", Context.MODE_PRIVATE) }
@@ -123,6 +137,7 @@ object VitalMonitor {
         appContext = context.applicationContext
         emergency = EmergencyActions(appContext)
         ble = EctriBleManager(appContext, bleListener)
+        audioRecorder = AudioRecorder(appContext)
         monitoringEnabled = prefs.getBoolean(KEY_ENABLED, false)
         profile = HealthProfile(
             heightCm = profilePrefs.getInt("height_cm", 0).takeIf { it > 0 },
@@ -155,6 +170,20 @@ object VitalMonitor {
 
     fun startTest(testType: EctriBleManager.TestType) = ble.startTest(testType)
 
+    fun enableTapControl() = ble.enableTapControl()
+
+    // Gestures just after one another are ignored: a slow tap must not undo itself.
+    private fun onRingGesture(code: Int) {
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastTapMs < TAP_DEBOUNCE_MS) return
+
+        lastTapMs = now
+        when (code) {
+            EctriBleManager.GESTURE_RECORD -> toggleRecording("bague")
+            EctriBleManager.GESTURE_SOS -> if (!alertActive) raiseAlert("SOS demandé depuis la bague")
+        }
+    }
+
     fun connect(address: String) {
         val manager = appContext.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         val device = manager?.adapter?.getRemoteDevice(address) ?: return
@@ -172,7 +201,7 @@ object VitalMonitor {
             handler.removeCallbacks(measureLoop)
             handler.removeCallbacks(reconnectLoop)
             cancelAlert(silent = true)
-            appContext.stopService(Intent(appContext, MonitoringService::class.java))
+            if (recordingFile == null) stopService()
             emergency.speak("Monitoring désactivé")
         }
     }
@@ -184,13 +213,63 @@ object VitalMonitor {
         ContextCompat.startForegroundService(appContext, service)
     }
 
+    private fun stopService() {
+        appContext.stopService(Intent(appContext, MonitoringService::class.java))
+    }
+
+    /** Started and stopped by the screen, and later by a double tap on the ring. */
+    fun toggleRecording(source: String) {
+        if (recordingFile != null) stopRecording(source) else startRecording()
+    }
+
+    private fun startRecording() {
+        if (!emergency.hasPermission(Manifest.permission.RECORD_AUDIO)) {
+            bleStatus = "Enregistrement: micro non autorisé"
+            return
+        }
+
+        // The microphone stays available in the background only through the foreground service.
+        // Restarting it from the background would be refused, so a running one is left alone.
+        if (!serviceRunning) ensureServiceRunning()
+        val name = audioRecorder.start()
+        if (name == null) {
+            bleStatus = "Enregistrement: micro indisponible"
+            if (!monitoringEnabled) stopService()
+            return
+        }
+        recordingFile = name
+        vibrate(longArrayOf(0, 150))
+    }
+
+    fun stopRecording(source: String) {
+        if (recordingFile == null) return
+
+        audioRecorder.stop()
+        logRaw("Enregistré ($source): Musique/SuperSOS/$recordingFile")
+        recordingFile = null
+        vibrate(longArrayOf(0, 100, 100, 100))
+        if (!monitoringEnabled) stopService()
+    }
+
+    private fun vibrate(pattern: LongArray) {
+        val vibrator = appContext.getSystemService(Vibrator::class.java) ?: return
+        vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+    }
+
     /** Called by the service, also after Android restarted it. */
     fun startLoops() {
-        monitoringEnabled = true
+        if (!monitoringEnabled) return
+
         handler.removeCallbacks(measureLoop)
         handler.removeCallbacks(reconnectLoop)
         handler.post(measureLoop)
         handler.post(reconnectLoop)
+    }
+
+    fun logRaw(line: String) {
+        val time = SimpleDateFormat("HH:mm:ss", Locale.ROOT).format(Date())
+        rawLog.add(0, "$time $line")
+        if (rawLog.size > RAW_LOG_SIZE) rawLog.removeAt(rawLog.lastIndex)
     }
 
     fun reportBleStatus(status: String) {
@@ -204,6 +283,7 @@ object VitalMonitor {
 
     fun cancelAlert(silent: Boolean = false) {
         val wasActive = alertActive
+        if (wasActive) logRaw("SOS annulé")
         alertActive = false
         alertReason = null
         handler.removeCallbacks(countdown)
@@ -261,6 +341,14 @@ object VitalMonitor {
         override fun onMeasurement(measurement: EctriBleManager.Measurement) {
             handler.post { applyMeasurement(measurement) }
         }
+
+        override fun onRawFrame(frame: String) {
+            handler.post { logRaw(frame) }
+        }
+
+        override fun onRingGesture(code: Int) {
+            handler.post { VitalMonitor.onRingGesture(code) }
+        }
     }
 
     private fun applyMeasurement(measurement: EctriBleManager.Measurement) {
@@ -283,6 +371,7 @@ object VitalMonitor {
     }
 
     private fun raiseAlert(reason: String) {
+        logRaw("SOS: $reason")
         alertReason = reason
         alertActive = true
         countdownSeconds = 10
@@ -294,6 +383,7 @@ object VitalMonitor {
 
     // Nobody may be able to confirm it: without a position the call matters more.
     private fun triggerSos() {
+        logRaw("SOS: compte à rebours terminé")
         alertActive = false
         vitalAlerts.reset()
         notifications.cancel(ALERT_NOTIFICATION)

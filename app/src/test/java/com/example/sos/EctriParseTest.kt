@@ -41,12 +41,42 @@ class EctriParseTest {
     }
 
     @Test
-    fun lastTemperatureRequestMatchesEctri() {
-        val packet = EctriBleManager.READ_LAST_TEMPERATURE_PACKET
+    fun temperatureRequestsMatchEctri() {
+        val count = EctriBleManager.READ_TEMP_COUNT_PACKET
+        val history = EctriBleManager.READ_TEMP_HISTORY_PACKET
+        assertEquals(20, count.size)
+        assertEquals(0xFC.toByte(), count[0])
+        assertEquals(0x40.toByte(), count[1])
+        assertEquals(2.toByte(), count[2])
+        assertEquals(1.toByte(), history[2])
+    }
+
+    @Test
+    fun tapModePacketMatchesEctri() {
+        val packet = EctriBleManager.MUSIC_CONTROL_MODE_PACKET
+        val expected = listOf(0xFC, 0x5E, 0x62, 0x03, 0x09, 0x00, 0x08)
         assertEquals(20, packet.size)
-        assertEquals(0xFC.toByte(), packet[0])
-        assertEquals(0x40.toByte(), packet[1])
-        assertEquals(0.toByte(), packet[2])
+        expected.forEachIndexed { index, value -> assertEquals(value.toByte(), packet[index]) }
+        assertEquals(0x30.toByte(), packet[19])
+        assertEquals(0, packet.sumOf { it.toInt() } and 0xFF)
+    }
+
+    private fun ringFrame(second: Int, third: Int) = ByteArray(20).also {
+        it[0] = 0xFC.toByte()
+        it[1] = second.toByte()
+        it[2] = third.toByte()
+    }
+
+    @Test
+    fun ringGesturesCarryTheirCode() {
+        assertEquals(EctriBleManager.GESTURE_RECORD, EctriBleManager.ringGesture(ringFrame(0x3C, 3)))
+        assertEquals(EctriBleManager.GESTURE_SOS, EctriBleManager.ringGesture(ringFrame(0x3C, 2)))
+    }
+
+    @Test
+    fun otherRingFramesAreNotGestures() {
+        assertNull(EctriBleManager.ringGesture(ringFrame(0x0F, 0x91)))
+        assertNull(EctriBleManager.ringGesture(EctriBleManager.MUSIC_CONTROL_MODE_PACKET))
     }
 
     @Test

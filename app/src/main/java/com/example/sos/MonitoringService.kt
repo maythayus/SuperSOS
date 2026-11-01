@@ -20,11 +20,18 @@ class MonitoringService : Service() {
     override fun onCreate() {
         super.onCreate()
         VitalMonitor.init(this)
+        VitalMonitor.serviceRunning = true
         val power = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SuperSOS:monitoring").apply { acquire() }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // The service already runs: going foreground again would drop the microphone type.
+        if (intent?.action == ACTION_CANCEL_ALERT) {
+            VitalMonitor.cancelAlert()
+            return START_STICKY
+        }
+
         val foreground = goForeground(intent?.getBooleanExtra(EXTRA_FROM_UI, false) == true)
         if (!foreground) {
             VitalMonitor.reportServiceRefused()
@@ -32,17 +39,19 @@ class MonitoringService : Service() {
             return START_NOT_STICKY
         }
 
-        if (intent?.action == ACTION_CANCEL_ALERT) VitalMonitor.cancelAlert() else VitalMonitor.startLoops()
+        VitalMonitor.startLoops()
         return START_STICKY
     }
 
     override fun onDestroy() {
+        VitalMonitor.serviceRunning = false
+        VitalMonitor.stopRecording("service arrêté")
         wakeLock?.takeIf { it.isHeld }?.release()
         super.onDestroy()
     }
 
-    // The location type is only allowed from the foreground: restarts run without it, and the
-    // call then goes out without a position.
+    // Location and microphone are only allowed from the foreground: restarts run without them,
+    // so a call goes out without a position and a recording needs the app to be opened once.
     private fun goForeground(fromUi: Boolean): Boolean {
         val open = PendingIntent.getActivity(
             this,
@@ -52,7 +61,7 @@ class MonitoringService : Service() {
         )
         val notification = NotificationCompat.Builder(this, VitalMonitor.SERVICE_CHANNEL)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
-            .setContentTitle("SuperSOS surveille vos constantes")
+            .setContentTitle("SuperSOS est actif")
             .setContentIntent(open)
             .setOngoing(true)
             .build()
@@ -62,6 +71,9 @@ class MonitoringService : Service() {
                 var type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
                 if (fromUi && VitalMonitor.emergency.hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)) {
                     type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+                }
+                if (fromUi && VitalMonitor.emergency.hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                    type = type or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
                 }
                 startForeground(NOTIFICATION_ID, notification, type)
             } else {

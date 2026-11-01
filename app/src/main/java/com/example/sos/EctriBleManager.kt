@@ -33,6 +33,8 @@ class EctriBleManager(
         fun onConnected(device: BluetoothDevice)
         fun onDisconnected()
         fun onMeasurement(measurement: Measurement)
+        fun onRawFrame(frame: String)
+        fun onRingGesture(code: Int)
     }
 
     data class Measurement(
@@ -65,6 +67,8 @@ class EctriBleManager(
     private var txChar: BluetoothGattCharacteristic? = null
     private var rxChar: BluetoothGattCharacteristic? = null
     private var discoveryRetries = 0
+    private var temperaturePending = false
+    private var temperatureFrameSeen = false
     private val handler = Handler(Looper.getMainLooper())
 
     // Android runs one GATT operation at a time: a write issued while another is pending is
@@ -161,11 +165,17 @@ class EctriBleManager(
         override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
             @Suppress("DEPRECATION")
             val value = characteristic.getValue() ?: return
+            // Anything but a measurement is shown, to find out what a tap on the ring sends.
+            val first = value.firstOrNull()?.toInt()?.and(0xFF)
+            val isBattery = first == 0x0F && value.getOrNull(1)?.toInt() == 0x06
+            if (first !in MEASUREMENT_FRAMES && !isBattery) reportRawFrame("Bague", value)
             if (value.size != 20) return
+            ringGesture(value)?.let(listener::onRingGesture)
             if (!hasShortId(characteristic.uuid, ECTRI_RX_CHAR_ID)) return
 
             val type = value[0].toInt() and 0xFF
             val payload = value.copyOfRange(1, value.size).map { it.toInt() and 0xFF }.toIntArray()
+            if (type == 0x40) onTemperatureFrame(payload, value)
             val m = parseMeasurement(type, payload, value)
             if (m != null) {
                 listener.onMeasurement(m)
@@ -286,15 +296,51 @@ class EctriBleManager(
 
         // ECTRI does not receive the temperature from the test: it reads it back from the ring.
         if (testType == TestType.TEMP) {
-            TEMP_READ_DELAYS_MS.forEach { delay -> handler.postDelayed(::readLastTemperature, delay) }
+            temperaturePending = true
+            temperatureFrameSeen = false
+            TEMP_READ_DELAYS_MS.forEach { delay ->
+                handler.postDelayed({ writeRaw(READ_TEMP_COUNT_PACKET) }, delay)
+            }
+            handler.postDelayed(::reportTemperatureSilence, TEMP_READ_DELAYS_MS.last() + TEMP_ANSWER_DELAY_MS)
         }
     }
 
-    private fun readLastTemperature() {
+    /** Makes the ring report its gesture to the app, like ECTRI's music control interaction. */
+    fun enableTapControl() {
+        if (txChar == null) {
+            listener.onStatus("Pas connecté")
+            return
+        }
+
+        writeRaw(MUSIC_CONTROL_MODE_PACKET)
+        reportRawFrame("Envoyé", MUSIC_CONTROL_MODE_PACKET)
+        listener.onStatus("Double tap: commande envoyée à la bague")
+    }
+
+    private fun writeRaw(packet: ByteArray) {
         if (txChar == null) return
 
-        synchronized(pendingWrites) { pendingWrites.addLast(READ_LAST_TEMPERATURE_PACKET) }
+        synchronized(pendingWrites) { pendingWrites.addLast(packet) }
         drainWrites()
+    }
+
+    private fun onTemperatureFrame(payload: IntArray, value: ByteArray) {
+        temperatureFrameSeen = true
+        reportRawFrame("Temp", value)
+        if (payload[0] == FRAME_HISTORY_NUM) {
+            val count = (payload[1] shl 8) or payload[2]
+            listener.onStatus("Température: $count mesure(s) dans la bague")
+            if (count > 0) writeRaw(READ_TEMP_HISTORY_PACKET)
+        }
+    }
+
+    private fun reportTemperatureSilence() {
+        temperaturePending = false
+        if (!temperatureFrameSeen) listener.onStatus("Température: aucune réponse de la bague")
+    }
+
+    private fun reportRawFrame(label: String, value: ByteArray) {
+        listener.onRawFrame("$label: " + value.joinToString(" ") { "%02X".format(it) })
     }
 
     private fun onOperationDone() {
@@ -397,15 +443,34 @@ class EctriBleManager(
         private const val MAX_DISCOVERY_RETRIES = 3
         private val TEMP_READ_DELAYS_MS = listOf(15_000L, 30_000L, 45_000L, 60_000L)
 
-        // ECTRI ManBeanEnum.HealthTemp [0xFC, 0x40] with ManHealthType.LastData.
-        val READ_LAST_TEMPERATURE_PACKET = ByteArray(20).also {
+        private const val TEMP_ANSWER_DELAY_MS = 5_000L
+
+        // ECTRI BleCmd.setHidTouch with HidTouchType.MusicControl: type 0x5E, then its 5 bytes.
+        val MUSIC_CONTROL_MODE_PACKET = checkedPacket(0x5E, 0x62, 0x03, 0x09, 0x00, 0x08)
+
+        /** ECTRI BleProtocol: head, type and body on 19 bytes, then the negated sum of them. */
+        private fun checkedPacket(type: Int, vararg body: Int) = ByteArray(20).also { packet ->
+            packet[0] = 0xFC.toByte()
+            packet[1] = type.toByte()
+            body.forEachIndexed { index, value -> packet[index + 2] = value.toByte() }
+            packet[19] = (-packet.sumOf { it.toInt() }).toByte()
+        }
+        private val MEASUREMENT_FRAMES = setOf(0x0A, 0x11, 0x12, 0x40)
+
+        // ECTRI ManBeanEnum.HealthTemp [0xFC, 0x40] with ManHealthType.HistoryNum, then HistoryData.
+        val READ_TEMP_COUNT_PACKET = healthTempPacket(2)
+        val READ_TEMP_HISTORY_PACKET = healthTempPacket(1)
+
+        private fun healthTempPacket(frameType: Int) = ByteArray(20).also {
             it[0] = 0xFC.toByte()
             it[1] = 0x40.toByte()
+            it[2] = frameType.toByte()
         }
 
         // ECTRI ManHealthType, first payload byte of a HealthTemp frame.
         private const val FRAME_LAST_DATA = 0
         private const val FRAME_HISTORY_DATA = 1
+        private const val FRAME_HISTORY_NUM = 2
         private const val FRAME_SEND_CURRENT = 4
         private const val DISCOVERY_RETRY_DELAY_MS = 1_500L
 
@@ -465,6 +530,16 @@ class EctriBleManager(
 
                 else -> null
             }
+        }
+
+        // Seen on an R13: 03 for a double tap, 02 less often while mixing double and triple taps.
+        const val GESTURE_RECORD = 3
+        const val GESTURE_SOS = 2
+
+        /** ECTRI ManBeanEnum.ReadMusicControl: FC 3C then the gesture code. */
+        fun ringGesture(frame: ByteArray): Int? {
+            if (frame.size < 3 || frame[0] != 0xFC.toByte() || frame[1] != 0x3C.toByte()) return null
+            return frame[2].toInt() and 0xFF
         }
 
         fun hasShortId(uuid: UUID, shortId: Int): Boolean {

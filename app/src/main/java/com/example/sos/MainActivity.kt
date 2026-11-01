@@ -7,6 +7,8 @@ import android.net.Uri
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
+import android.view.KeyEvent
+import android.view.MotionEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -57,6 +59,23 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // A ring tap may reach Android as a keyboard or touch device instead of a BLE frame.
+    @SuppressLint("RestrictedApi")
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean {
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            VitalMonitor.logRaw("Touche: ${KeyEvent.keyCodeToString(event.keyCode)} (${event.device?.name})")
+        }
+        return super.dispatchKeyEvent(event)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val external = android.os.Build.VERSION.SDK_INT >= 29 && event.device?.isExternal == true
+        if (external && event.actionMasked == MotionEvent.ACTION_DOWN) {
+            VitalMonitor.logRaw("Geste: ${event.device?.name}")
+        }
+        return super.dispatchTouchEvent(event)
+    }
+
     private fun hasPermission(permission: String) = emergency.hasPermission(permission)
 
     private fun speak(text: String) = emergency.speak(text)
@@ -98,6 +117,16 @@ class MainActivity : ComponentActivity() {
             VitalMonitor.setMonitoring(true)
             requestBatteryExemption()
         }
+        val microphonePermissionLauncher = rememberLauncherForActivityResult(
+            contract = ActivityResultContracts.RequestPermission(),
+            onResult = { granted ->
+                if (granted) {
+                    // A running service must be told it may now use the microphone.
+                    if (VitalMonitor.serviceRunning) VitalMonitor.ensureServiceRunning()
+                    VitalMonitor.toggleRecording("bouton")
+                }
+            }
+        )
         val notificationPermissionLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.RequestPermission(),
             onResult = { startMonitoring() }
@@ -327,6 +356,21 @@ class MainActivity : ComponentActivity() {
             )
 
             Text(text = "---")
+            Text(text = VitalMonitor.recordingFile?.let { "Enregistrement en cours: $it" } ?: "Enregistrement arrêté")
+            Button(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = {
+                    if (hasPermission(Manifest.permission.RECORD_AUDIO)) {
+                        VitalMonitor.toggleRecording("bouton")
+                    } else {
+                        microphonePermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                    }
+                }
+            ) {
+                Text(if (VitalMonitor.recordingFile != null) "Arrêter l'enregistrement" else "Enregistrer (micro)")
+            }
+
+            Text(text = "---")
             Text(text = "Bague ECTRI")
             Text(text = VitalMonitor.bleStatus)
             Text(text = "Connecté: ${VitalMonitor.connectedDeviceName ?: "non"}")
@@ -396,6 +440,13 @@ class MainActivity : ComponentActivity() {
 
             Button(
                 modifier = Modifier.fillMaxWidth(),
+                onClick = { VitalMonitor.enableTapControl() }
+            ) {
+                Text("Activer le double tap (enregistrement)")
+            }
+
+            Button(
+                modifier = Modifier.fillMaxWidth(),
                 onClick = { VitalMonitor.startTest(EctriBleManager.TestType.HR) }
             ) {
                 Text("Mesurer FC")
@@ -426,6 +477,8 @@ class MainActivity : ComponentActivity() {
             Text(text = "SpO2: ${VitalMonitor.lastSpo2 ?: "--"} %")
             Text(text = "Tension: ${VitalMonitor.lastBpHigh ?: "--"}/${VitalMonitor.lastBpLow ?: "--"}")
             Text(text = "Temp: ${VitalMonitor.lastTemp ?: "--"} °C${VitalMonitor.lastTempTime?.let { " (mesurée à $it)" }.orEmpty()}")
+            Text(text = "Journal bague:")
+            VitalMonitor.rawLog.forEach { Text(text = it) }
         }
     }
 }
