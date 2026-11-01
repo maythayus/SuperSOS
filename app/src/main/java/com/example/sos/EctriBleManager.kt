@@ -1,5 +1,6 @@
 package com.example.sos
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
@@ -10,10 +11,12 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothGattService
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.content.pm.PackageManager
 import android.os.Build
 import java.nio.ByteBuffer
 import java.util.UUID
@@ -75,6 +78,7 @@ class EctriBleManager(
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
+        @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
                 listener.onStatus("BLE erreur connexion: $status")
@@ -88,7 +92,11 @@ class EctriBleManager(
                     listener.onStatus("Connecté, découverte services…")
                     this@EctriBleManager.gatt = gatt
                     listener.onConnected(gatt.device)
-                    gatt.discoverServices()
+                    if (hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+                        gatt.discoverServices()
+                    } else {
+                        listener.onStatus(MISSING_PERMISSION_STATUS)
+                    }
                 }
 
                 BluetoothProfile.STATE_DISCONNECTED -> {
@@ -147,7 +155,20 @@ class EctriBleManager(
         }
     }
 
+    // BLUETOOTH_SCAN and BLUETOOTH_CONNECT only exist from Android 12; they can be revoked at any
+    // time and a BLE call made without them throws SecurityException.
+    private fun hasBlePermission(permission: String): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.S ||
+            context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+    }
+
+    @SuppressLint("MissingPermission")
     fun startScan() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_SCAN)) {
+            listener.onStatus(MISSING_PERMISSION_STATUS)
+            return
+        }
+
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
             listener.onStatus("Bluetooth désactivé")
@@ -168,7 +189,10 @@ class EctriBleManager(
         scanner.startScan(null, settings, scanCallback)
     }
 
+    @SuppressLint("MissingPermission")
     fun stopScan() {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_SCAN)) return
+
         val adapter = bluetoothAdapter ?: return
         val scanner = adapter.bluetoothLeScanner ?: return
         scanner.stopScan(scanCallback)
@@ -177,6 +201,11 @@ class EctriBleManager(
 
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
+        if (!hasBlePermission(Manifest.permission.BLUETOOTH_CONNECT)) {
+            listener.onStatus(MISSING_PERMISSION_STATUS)
+            return
+        }
+
         stopScan()
         listener.onStatus("Connexion…")
         closeGatt()
@@ -234,7 +263,7 @@ class EctriBleManager(
 
         val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             g.writeCharacteristic(tx, data, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) ==
-                BluetoothGatt.GATT_SUCCESS
+                BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
@@ -264,7 +293,7 @@ class EctriBleManager(
         val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             // Android 13+: use non-deprecated overload.
             gatt.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) ==
-                BluetoothGatt.GATT_SUCCESS
+                BluetoothStatusCodes.SUCCESS
         } else {
             @Suppress("DEPRECATION")
             run {
@@ -322,6 +351,8 @@ class EctriBleManager(
         }
     }
 
+    // Best-effort cleanup: the try blocks already absorb a SecurityException.
+    @SuppressLint("MissingPermission")
     private fun closeGatt() {
         try {
             gatt?.disconnect()
@@ -341,6 +372,8 @@ class EctriBleManager(
     }
 
     companion object {
+        private const val MISSING_PERMISSION_STATUS = "Permission bluetooth manquante"
+
         // Extracted from ECTRI ManConstants
         val ECTRI_SCAN_SERVICE_UUID: UUID = UUID.fromString("0000EFE0-0000-1000-8000-00805F9B34FB")
         val ECTRI_SERVICE_UUID: UUID = UUID.fromString("F000EFE0-0451-4000-0000-00000000B000")

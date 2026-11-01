@@ -1,7 +1,10 @@
 package com.example.sos
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
 import android.content.Intent
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.net.Uri
 import android.os.Bundle
@@ -108,12 +111,24 @@ class MainActivity : ComponentActivity() {
 
     private fun startEmergencyCall(number: String) {
         val callIntent = Intent(Intent.ACTION_CALL, Uri.parse("tel:$number"))
-        if (hasPermission(Manifest.permission.CALL_PHONE)) {
-            startActivity(callIntent)
-        } else {
-            val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number"))
-            startActivity(dialIntent)
+        try {
+            if (hasPermission(Manifest.permission.CALL_PHONE)) {
+                startActivity(callIntent)
+            } else {
+                val dialIntent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$number"))
+                startActivity(dialIntent)
+            }
+        } catch (_: ActivityNotFoundException) {
+            // Devices without telephony (tablets) have nothing to handle the intent.
+            speak("Appel impossible sur cet appareil")
         }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun bluetoothNameOf(device: BluetoothDevice): String? {
+        val allowed = android.os.Build.VERSION.SDK_INT < 31 ||
+            hasPermission(Manifest.permission.BLUETOOTH_CONNECT)
+        return if (allowed) device.name else null
     }
 
     private fun getCountryIso(): String? {
@@ -121,7 +136,15 @@ class MainActivity : ComponentActivity() {
         return tm?.networkCountryIso?.takeIf { it.isNotBlank() }
     }
 
+    @SuppressLint("MissingPermission")
     private fun requestOneLocation(onResult: (Double, Double) -> Unit, onError: (String) -> Unit) {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) &&
+            !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+        ) {
+            onError("Permission localisation refusée")
+            return
+        }
+
         val tokenSource = CancellationTokenSource()
         fusedLocationClient
             .getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, tokenSource.token)
@@ -184,7 +207,7 @@ class MainActivity : ComponentActivity() {
 
                     override fun onDeviceFound(device: android.bluetooth.BluetoothDevice, rssi: Int) {
                         val addr = device.address ?: return
-                        val name = device.name ?: "(sans nom)"
+                        val name = bluetoothNameOf(device) ?: "(sans nom)"
                         mainHandler.post {
                             val exists = devices.any { it.second == addr }
                             if (!exists) devices.add(name to addr)
@@ -192,7 +215,7 @@ class MainActivity : ComponentActivity() {
                     }
 
                     override fun onConnected(device: android.bluetooth.BluetoothDevice) {
-                        val name = device.name ?: device.address
+                        val name = bluetoothNameOf(device) ?: device.address
                         mainHandler.post { connectedDeviceName = name }
                     }
 
