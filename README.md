@@ -29,6 +29,19 @@ Android emergency assistance app (Kotlin / Jetpack Compose).
     - GPS position + Maps link
     - latest measured vitals
 
+- Profile (read to first responders):
+  - Height, weight and free-text medical info (allergies, treatments, blood type).
+  - Saved on the phone and included in the "I can't speak" message.
+
+## Troubleshooting the ring
+
+- **Nothing found when scanning:** turn on phone location (many phones return no BLE results
+  without it) and close the official ring app, since the ring accepts only one connection.
+  The likely ring is marked with ★.
+- **Connected but measurements do nothing:** the app looks for the `EFE0` service in both its
+  128-bit (`F000EFE0-0451-…`) and 16-bit (`0000EFE0-…`) forms. If neither is found, the status
+  line lists the services the ring exposes (`Services vus: …`). Report that line in an issue.
+
 ## Android permissions
 
 The app requests (depending on actions):
